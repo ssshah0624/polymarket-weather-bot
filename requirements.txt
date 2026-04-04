@@ -1,0 +1,25 @@
+# Core
+requests>=2.31.0
+python-dotenv>=1.0.0
+
+# Data & Analysis
+pandas>=2.1.0
+numpy>=1.24.0
+
+# Visualization (backtest reports)
+matplotlib>=3.7.0
+
+# Database (trade log, backtest storage)
+sqlalchemy>=2.0.0
+
+# Scheduling
+schedule>=1.2.0
+
+# CLI
+rich>=13.0.0
+
+# Polymarket CLOB (needed for live trading only)
+# py-clob-client>=0.1.0
+
+# Testing
+pytest>=7.4.0

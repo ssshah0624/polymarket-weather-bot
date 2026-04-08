@@ -9,7 +9,7 @@ from contextlib import contextmanager
 
 from sqlalchemy import (
     create_engine, Column, Integer, Float, String, Boolean, DateTime, Text,
-    Index,
+    Index, inspect, text,
 )
 from sqlalchemy.orm import declarative_base, sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -31,17 +31,23 @@ class Trade(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     timestamp = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    venue = Column(String(30), default="polymarket")
     mode = Column(String(10))  # paper | live
     event_title = Column(String(200))
     event_id = Column(String(50))
+    venue_event_id = Column(String(100))
     city = Column(String(50))
     target_date = Column(String(10))
     bucket_question = Column(String(300))
     market_id = Column(String(100))
+    venue_market_id = Column(String(100))
     token_id = Column(String(100))
+    client_order_id = Column(String(100))
+    venue_order_id = Column(String(100))
     side = Column(String(4))  # BUY | SELL
     size_usd = Column(Float)
     price = Column(Float)  # market price at time of trade
+    entry_price = Column(Float)  # all-in entry price for the selected side
     ensemble_prob = Column(Float)
     edge = Column(Float)
     kelly_pct = Column(Float)
@@ -67,11 +73,16 @@ class MarketSnapshot(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     timestamp = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    venue = Column(String(30), default="polymarket")
     event_title = Column(String(200))
+    venue_event_id = Column(String(100))
+    venue_market_id = Column(String(100))
     city = Column(String(50))
     target_date = Column(String(10))
     bucket_question = Column(String(300))
     market_prob = Column(Float)
+    yes_price = Column(Float)
+    no_price = Column(Float)
     ensemble_prob = Column(Float)
     ensemble_mean = Column(Float)
     ensemble_spread = Column(Float)
@@ -113,6 +124,43 @@ _engine = None
 _Session = None
 
 
+def _run_schema_migrations(engine):
+    """Additive sqlite migrations for new columns used by multi-venue support."""
+    inspector = inspect(engine)
+    table_names = set(inspector.get_table_names())
+
+    trade_columns = {
+        "venue": "VARCHAR(30) DEFAULT 'polymarket'",
+        "venue_event_id": "VARCHAR(100)",
+        "venue_market_id": "VARCHAR(100)",
+        "client_order_id": "VARCHAR(100)",
+        "venue_order_id": "VARCHAR(100)",
+        "entry_price": "FLOAT",
+        "fee_usd": "FLOAT DEFAULT 0.0",
+        "resolution_price": "FLOAT",
+        "actual_temp": "FLOAT",
+    }
+    snapshot_columns = {
+        "venue": "VARCHAR(30) DEFAULT 'polymarket'",
+        "venue_event_id": "VARCHAR(100)",
+        "venue_market_id": "VARCHAR(100)",
+        "yes_price": "FLOAT",
+        "no_price": "FLOAT",
+    }
+
+    with engine.begin() as conn:
+        if "trades" in table_names:
+            existing = {col["name"] for col in inspector.get_columns("trades")}
+            for column_name, column_type in trade_columns.items():
+                if column_name not in existing:
+                    conn.execute(text(f"ALTER TABLE trades ADD COLUMN {column_name} {column_type}"))
+        if "market_snapshots" in table_names:
+            existing = {col["name"] for col in inspector.get_columns("market_snapshots")}
+            for column_name, column_type in snapshot_columns.items():
+                if column_name not in existing:
+                    conn.execute(text(f"ALTER TABLE market_snapshots ADD COLUMN {column_name} {column_type}"))
+
+
 def get_engine():
     global _engine
     if _engine is None:
@@ -124,6 +172,7 @@ def get_engine():
             poolclass=StaticPool,
         )
         Base.metadata.create_all(_engine)
+        _run_schema_migrations(_engine)
         logger.info(f"Database initialized at {DB_PATH}")
     return _engine
 
@@ -155,22 +204,27 @@ def session_scope():
 
 def log_trade(signal: dict, mode: str = "paper") -> Trade:
     """Log a trade to the database."""
-    from core.alerts import calc_fee_usd
-    fee = calc_fee_usd(signal.get("trade_size", 0), signal.get("market_prob", 0))
+    fee = signal.get("trade_size", 0) * signal.get("fee_pct", 0.0)
 
     with session_scope() as session:
         trade = Trade(
+            venue=signal.get("venue", "polymarket"),
             mode=mode,
             event_title=signal.get("event_title", ""),
             event_id=str(signal.get("event_id", "")),
+            venue_event_id=str(signal.get("venue_event_id", signal.get("event_id", ""))),
             city=signal.get("city", ""),
             target_date=signal.get("target_date", ""),
             bucket_question=signal.get("bucket_question", ""),
             market_id=signal.get("market_id", ""),
+            venue_market_id=str(signal.get("venue_market_id", signal.get("market_id", ""))),
             token_id=signal.get("yes_token_id") if signal.get("side") == "BUY" else signal.get("no_token_id"),
+            client_order_id=signal.get("client_order_id"),
+            venue_order_id=signal.get("venue_order_id"),
             side=signal.get("side", ""),
             size_usd=signal.get("trade_size", 0),
             price=signal.get("market_prob", 0),
+            entry_price=signal.get("entry_price"),
             ensemble_prob=signal.get("ensemble_prob", 0),
             edge=signal.get("edge", 0),
             kelly_pct=signal.get("kelly_pct", 0),
@@ -183,7 +237,8 @@ def log_trade(signal: dict, mode: str = "paper") -> Trade:
         return trade
 
 
-def has_existing_trade(city: str, target_date: str, bucket_question: str, mode: str = "paper") -> bool:
+def has_existing_trade(city: str, target_date: str, bucket_question: str,
+                       mode: str = "paper", venue: str = None) -> bool:
     """
     Check if we already have an unresolved trade on this exact bucket.
     Prevents duplicate bets on the same outcome across scan cycles.
@@ -195,20 +250,23 @@ def has_existing_trade(city: str, target_date: str, bucket_question: str, mode: 
             bucket_question=bucket_question,
             mode=mode,
             resolved=False,
-        ).first()
+        )
+        if venue:
+            existing = existing.filter_by(venue=venue)
+        existing = existing.first()
         return existing is not None
 
 
 def get_traded_buckets(mode: str = "paper") -> set:
     """
-    Get a set of (city, target_date, bucket_question) tuples for all
+    Get a set of (venue, city, target_date, bucket_question) tuples for all
     unresolved trades. Used for fast dedup checking.
     """
     with session_scope() as session:
         trades = session.query(
-            Trade.city, Trade.target_date, Trade.bucket_question
+            Trade.venue, Trade.city, Trade.target_date, Trade.bucket_question
         ).filter_by(mode=mode, resolved=False).all()
-        return {(t.city, t.target_date, t.bucket_question) for t in trades}
+        return {(t.venue, t.city, t.target_date, t.bucket_question) for t in trades}
 
 
 def resolve_trade(trade_id: int, outcome: str, pnl: float,
@@ -233,9 +291,10 @@ def get_unresolved_trades(mode: str = None) -> list[dict]:
             q = q.filter_by(mode=mode)
         return [
             {
-                "id": t.id, "event_title": t.event_title, "city": t.city,
+                "id": t.id, "venue": t.venue, "event_title": t.event_title, "city": t.city,
                 "target_date": t.target_date, "bucket_question": t.bucket_question,
                 "side": t.side, "size_usd": t.size_usd, "price": t.price,
+                "entry_price": t.entry_price,
                 "ensemble_prob": t.ensemble_prob, "edge": t.edge,
                 "fee_usd": t.fee_usd or 0.0,
             }
@@ -311,11 +370,16 @@ def log_snapshot(signal: dict):
         meta = signal.get("ensemble_meta", {})
         nws = signal.get("nws_forecast") or {}
         snap = MarketSnapshot(
+            venue=signal.get("venue", "polymarket"),
             event_title=signal.get("event_title", ""),
+            venue_event_id=str(signal.get("venue_event_id", signal.get("event_id", ""))),
+            venue_market_id=str(signal.get("venue_market_id", signal.get("market_id", ""))),
             city=signal.get("city", ""),
             target_date=signal.get("target_date", ""),
             bucket_question=signal.get("bucket_question", ""),
             market_prob=signal.get("market_prob", 0),
+            yes_price=signal.get("yes_price"),
+            no_price=signal.get("no_price"),
             ensemble_prob=signal.get("ensemble_prob", 0),
             ensemble_mean=meta.get("mean"),
             ensemble_spread=meta.get("spread"),

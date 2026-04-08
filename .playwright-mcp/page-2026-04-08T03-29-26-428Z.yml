@@ -1,0 +1,13 @@
+- generic [active] [ref=e1]:
+  - generic [ref=e4]:
+    - img "404 Not Found" [ref=e6]
+    - generic [ref=e7]:
+      - heading "Page not found" [level=2] [ref=e8]
+      - generic [ref=e9]:
+        - generic [ref=e11]:
+          - text: We can't seem to find the page you're looking for. Check to see if the link you're trying to visit is correct. If the problem persists,
+          - button "let us know." [ref=e12] [cursor=pointer]
+        - link "Go to home page" [ref=e13] [cursor=pointer]:
+          - /url: /
+          - generic [ref=e14]: Go to home page
+  - alert [ref=e15]

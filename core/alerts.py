@@ -12,12 +12,21 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from config.settings import SLACK_WEBHOOK_URL, LOG_DIR, LOG_LEVEL, PROJECT_ROOT
+from config.settings import (
+    KALSHI_FEE_BUFFER_PCT,
+    LOG_DIR,
+    LOG_LEVEL,
+    PROJECT_ROOT,
+    SLACK_WEBHOOK_URL,
+)
 
 logger = logging.getLogger(__name__)
 
 # Directory for detailed trade reports
 REPORTS_DIR = PROJECT_ROOT / "data" / "reports"
+SLACK_SECTION_TEXT_LIMIT = 3000
+SLACK_DAILY_RESULTS_CHAR_BUDGET = 2800
+SLACK_DAILY_RESULTS_MAX_LINES = 8
 
 
 # ============================================================
@@ -89,31 +98,38 @@ WEATHER_FEE_RATE = 0.025
 WEATHER_FEE_EXPONENT = 0.5
 
 
-def calc_fee_pct(price: float) -> float:
-    """Effective taker fee percentage for a weather market trade."""
+def calc_fee_pct(price: float, venue: str = "polymarket") -> float:
+    """Effective fee percentage for a venue trade."""
+    if venue == "kalshi":
+        return max(KALSHI_FEE_BUFFER_PCT, 0.0)
     if price <= 0 or price >= 1:
         return 0.0
     return WEATHER_FEE_RATE * (price * (1 - price)) ** WEATHER_FEE_EXPONENT
 
 
-def calc_fee_usd(size_usd: float, price: float) -> float:
+def calc_fee_usd(size_usd: float, price: float, venue: str = "polymarket",
+                 fee_pct: float | None = None) -> float:
     """Fee in USD for a given trade size and price."""
-    return size_usd * calc_fee_pct(price)
+    effective_fee_pct = fee_pct if fee_pct is not None else calc_fee_pct(price, venue=venue)
+    return size_usd * effective_fee_pct
 
 
-def calc_payout(size_usd: float, price: float, side: str) -> dict:
+def calc_payout(size_usd: float, price: float, side: str,
+                entry_price: float | None = None,
+                fee_pct: float | None = None,
+                venue: str = "polymarket") -> dict:
     """
     Correct Polymarket payout math.
     YES shares cost $price each. NO shares cost $(1-price) each.
     If you win, each share pays $1.
     """
-    fee = calc_fee_usd(size_usd, price)
+    fee = calc_fee_usd(size_usd, price, venue=venue, fee_pct=fee_pct)
     net_size = max(size_usd - fee, 0)
 
     if side == "BUY":  # YES
-        share_price = price
+        share_price = entry_price if entry_price is not None else price
     else:  # SELL = buying NO
-        share_price = 1.0 - price
+        share_price = entry_price if entry_price is not None else 1.0 - price
 
     if share_price < 0.03 or share_price > 0.97:
         return {"payout": 0, "profit": 0, "fee": round(fee, 2), "shares": 0}
@@ -160,6 +176,10 @@ def _yes_no(side: str) -> str:
     return "YES" if side == "BUY" else "NO"
 
 
+def _venue_label(value: str) -> str:
+    return (value or "polymarket").replace("_", " ").title()
+
+
 def _friendly_date(date_str: str) -> str:
     try:
         dt = datetime.strptime(date_str, "%Y-%m-%d")
@@ -168,12 +188,72 @@ def _friendly_date(date_str: str) -> str:
         return date_str or "?"
 
 
+def _build_daily_result_lines(details: list[dict],
+                              max_lines: int = SLACK_DAILY_RESULTS_MAX_LINES,
+                              char_budget: int = SLACK_DAILY_RESULTS_CHAR_BUDGET) -> tuple[str, int]:
+    """Fit resolved-trade rows into one Slack section while leaving room for an omitted note."""
+    lines = []
+    used = 0
+
+    for detail in details[:max_lines]:
+        emoji = ":white_check_mark:" if detail["won"] else ":x:"
+        venue = _venue_label(detail.get("venue", "polymarket"))
+        line = (
+            f"{emoji} {venue} | {detail['city']} | {detail['bucket'][:20]} | "
+            f"Actual: {detail['actual_temp_f']:.0f}\u00b0F | "
+            f"${detail['pnl']:+.2f}"
+        )
+        candidate = "\n".join(lines + [line])
+        if len(candidate) > char_budget:
+            break
+        lines.append(line)
+        used += 1
+
+    omitted = max(len(details) - used, 0)
+    if omitted > 0:
+        omission_line = f"...and {omitted} more results in report"
+        while lines:
+            candidate = "\n".join(lines + [omission_line])
+            if len(candidate) <= char_budget:
+                break
+            lines.pop()
+            used -= 1
+            omitted = len(details) - used
+            omission_line = f"...and {omitted} more results in report"
+        lines.append(omission_line)
+
+    return "\n".join(lines), omitted
+
+
+def _build_daily_fallback_text(date: str, verdict: str, resolved: int, wins: int,
+                               losses: int, daily_pnl: float, total_pnl: float,
+                               all_time_wr: float, all_time_trades: int,
+                               pending: int, report_path: str = "",
+                               venue_counts: dict[str, int] | None = None) -> str:
+    """Build a plain-text fallback when Slack rejects block payloads."""
+    lines = [
+        f"*Daily Pulse - {date}*",
+        verdict,
+        f"Today: {resolved} resolved ({wins}W / {losses}L) | P&L: ${daily_pnl:+.2f}",
+        f"All-time: {all_time_trades} trades | {all_time_wr:.0%} win rate | P&L: ${total_pnl:+.2f}",
+    ]
+    if venue_counts:
+        counts_text = ", ".join(f"{_venue_label(venue)}: {count}" for venue, count in sorted(venue_counts.items()))
+        lines.append(f"Resolved by venue: {counts_text}")
+    if pending > 0:
+        lines.append(f"{pending} trades still pending")
+    if report_path:
+        lines.append(f"Full report: `{report_path}`")
+    return "\n".join(lines)
+
+
 # ============================================================
 # Detailed Markdown Report (saved to droplet filesystem)
 # ============================================================
 
 def _build_trade_narrative(sig: dict) -> str:
     """Build a full natural language explanation for one trade (for the markdown file)."""
+    venue = sig.get("venue", "polymarket")
     city = sig.get("city", "?").replace("_", " ").title()
     date = _friendly_date(sig.get("target_date"))
     bucket = _bucket_label_f(sig)
@@ -187,7 +267,14 @@ def _build_trade_narrative(sig: dict) -> str:
     nws = sig.get("nws_forecast")
     meta = sig.get("ensemble_meta", {})
 
-    payout = calc_payout(size, market_prob, side)
+    payout = calc_payout(
+        size,
+        market_prob,
+        side,
+        entry_price=sig.get("entry_price"),
+        fee_pct=sig.get("fee_pct"),
+        venue=venue,
+    )
 
     # NWS line
     nws_line = ""
@@ -225,12 +312,12 @@ def _build_trade_narrative(sig: dict) -> str:
 
     if side == "BUY":
         mispricing_line = (
-            f"Polymarket prices this at {mkt_pct:.0f}%, but our models say {ens_pct:.0f}%. "
+            f"{_venue_label(venue)} prices this at {mkt_pct:.0f}%, but our models say {ens_pct:.0f}%. "
             f"The market is undervaluing this outcome by {edge_pct:.0f}%."
         )
     else:
         mispricing_line = (
-            f"Polymarket prices this at {mkt_pct:.0f}%, but our models say only {ens_pct:.0f}%. "
+            f"{_venue_label(venue)} prices this at {mkt_pct:.0f}%, but our models say only {ens_pct:.0f}%. "
             f"The market is overpricing this outcome by {edge_pct:.0f}%."
         )
 
@@ -251,7 +338,7 @@ def _build_trade_narrative(sig: dict) -> str:
         )
 
     return (
-        f"### {city} ({date}) | {bucket}\n\n"
+        f"### {_venue_label(venue)} | {city} ({date}) | {bucket}\n\n"
         f"{nws_line} {ensemble_line}\n\n"
         f"{mispricing_line}\n\n"
         f"{trade_line}\n"
@@ -259,7 +346,7 @@ def _build_trade_narrative(sig: dict) -> str:
 
 
 def save_scan_report(executed: list[dict], total_signals: int,
-                     bankroll: float, mode: str = "paper") -> str:
+                     bankroll, mode: str = "paper") -> str:
     """
     Save a detailed markdown report of the scan to the droplet filesystem.
     Returns the file path.
@@ -272,17 +359,36 @@ def save_scan_report(executed: list[dict], total_signals: int,
 
     mode_label = "PAPER" if mode == "paper" else "LIVE"
     total_invested = sum(s.get("trade_size", 0) for s in executed)
-    total_fees = sum(calc_fee_usd(s.get("trade_size", 0), s.get("market_prob", 0)) for s in executed)
+    total_fees = sum(
+        calc_fee_usd(
+            s.get("trade_size", 0),
+            s.get("market_prob", 0),
+            venue=s.get("venue", "polymarket"),
+            fee_pct=s.get("fee_pct"),
+        )
+        for s in executed
+    )
     consensus_count = sum(1 for s in executed if not s.get("is_contrarian"))
     contrarian_count = sum(1 for s in executed if s.get("is_contrarian"))
     yes_count = sum(1 for s in executed if s.get("side") == "BUY")
     no_count = sum(1 for s in executed if s.get("side") == "SELL")
+    venue_counts = {}
+    for trade in executed:
+        venue = trade.get("venue", "polymarket")
+        venue_counts[venue] = venue_counts.get(venue, 0) + 1
 
-    # Group by target date
-    by_date = {}
+    if isinstance(bankroll, dict):
+        bankroll_text = ", ".join(
+            f"{_venue_label(venue)} ${amount:.0f}"
+            for venue, amount in sorted(bankroll.items())
+        )
+    else:
+        bankroll_text = f"${bankroll:.0f}"
+
+    by_venue_date = {}
     for s in executed:
-        d = s.get("target_date", "unknown")
-        by_date.setdefault(d, []).append(s)
+        key = (s.get("venue", "polymarket"), s.get("target_date", "unknown"))
+        by_venue_date.setdefault(key, []).append(s)
 
     lines = [
         f"# {mode_label} Scan Report \u2014 {now.strftime('%a %b %-d, %Y at %H:%M UTC')}\n",
@@ -291,17 +397,18 @@ def save_scan_report(executed: list[dict], total_signals: int,
         f"|---|---|",
         f"| Total Invested | ${total_invested:.0f} |",
         f"| Estimated Fees | ${total_fees:.2f} |",
-        f"| Remaining Bankroll | ${bankroll:.0f} |",
+        f"| Remaining Bankroll | {bankroll_text} |",
         f"| YES Trades | {yes_count} |",
         f"| NO Trades | {no_count} |",
         f"| With Crowd | {consensus_count} |",
         f"| Against Crowd | {contrarian_count} |",
+        f"| Venues | {', '.join(f'{_venue_label(v)} {c}' for v, c in sorted(venue_counts.items()))} |",
         f"",
     ]
 
-    for target_date in sorted(by_date.keys()):
-        trades = by_date[target_date]
-        lines.append(f"\n## {_friendly_date(target_date)} ({target_date})\n")
+    for venue, target_date in sorted(by_venue_date.keys()):
+        trades = by_venue_date[(venue, target_date)]
+        lines.append(f"\n## {_venue_label(venue)} — {_friendly_date(target_date)} ({target_date})\n")
         for sig in trades:
             lines.append(_build_trade_narrative(sig))
             lines.append("---\n")
@@ -334,12 +441,12 @@ def save_resolution_report(details: list[dict], summary: dict) -> str:
     ]
 
     if details:
-        lines.append("| City | Date | Bucket | Bet | Stake | Actual Temp | Result | P&L |")
-        lines.append("|---|---|---|---|---|---|---|---|")
+        lines.append("| Venue | City | Date | Bucket | Bet | Stake | Actual Temp | Result | P&L |")
+        lines.append("|---|---|---|---|---|---|---|---|---|")
         for d in details:
             result_emoji = "WIN" if d["won"] else "LOSS"
             lines.append(
-                f"| {d['city']} | {d['target_date']} | "
+                f"| {_venue_label(d.get('venue', 'polymarket'))} | {d['city']} | {d['target_date']} | "
                 f"{d['bucket'][:30]} | {d['side']} | "
                 f"${d['size']:.0f} | {d['actual_temp_f']:.1f}\u00b0F | "
                 f"{result_emoji} | ${d['pnl']:+.2f} |"
@@ -355,14 +462,14 @@ def save_resolution_report(details: list[dict], summary: dict) -> str:
             mkt = d["market_price"] * 100
             ens = d["ensemble_prob"] * 100
 
-            lines.append(f"### {d['city']} \u2014 {d['bucket'][:50]}\n")
+            lines.append(f"### {_venue_label(d.get('venue', 'polymarket'))} | {d['city']} \u2014 {d['bucket'][:50]}\n")
             lines.append(
                 f"The actual high was **{d['actual_temp_f']:.1f}\u00b0F**. "
                 f"Did it land in the bucket? **{in_bucket}.**\n"
             )
             lines.append(
                 f"We bet **{d['side']}** at ${d['size']:.0f}. "
-                f"Polymarket had it at {mkt:.0f}%, our model said {ens:.0f}%. "
+                f"{_venue_label(d.get('venue', 'polymarket'))} had it at {mkt:.0f}%, our model said {ens:.0f}%. "
                 f"**Result: {result} (${d['pnl']:+.2f})**\n"
             )
             lines.append("---\n")
@@ -378,7 +485,7 @@ def save_resolution_report(details: list[dict], summary: dict) -> str:
 # ============================================================
 
 def alert_scan_summary(executed: list[dict], total_signals: int,
-                       bankroll: float, mode: str = "paper"):
+                       bankroll, mode: str = "paper"):
     """
     Send a COMPACT Slack summary (5-8 lines max).
     Full details are in the markdown report on the droplet.
@@ -390,10 +497,16 @@ def alert_scan_summary(executed: list[dict], total_signals: int,
     report_path = save_scan_report(executed, total_signals, bankroll, mode)
 
     mode_label = "PAPER" if mode == "paper" else "LIVE"
-    now = datetime.now(timezone.utc).strftime("%H:%M UTC")
     total_invested = sum(s.get("trade_size", 0) for s in executed)
     total_potential = sum(
-        calc_payout(s.get("trade_size", 0), s.get("market_prob", 0), s.get("side", "SELL")).get("profit", 0)
+        calc_payout(
+            s.get("trade_size", 0),
+            s.get("market_prob", 0),
+            s.get("side", "SELL"),
+            entry_price=s.get("entry_price"),
+            fee_pct=s.get("fee_pct"),
+            venue=s.get("venue", "polymarket"),
+        ).get("profit", 0)
         for s in executed
     )
     yes_count = sum(1 for s in executed if s.get("side") == "BUY")
@@ -401,23 +514,47 @@ def alert_scan_summary(executed: list[dict], total_signals: int,
     consensus_count = sum(1 for s in executed if not s.get("is_contrarian"))
     contrarian_count = sum(1 for s in executed if s.get("is_contrarian"))
     avg_edge = sum(abs(s.get("edge", 0)) for s in executed) / len(executed) * 100
+    venue_counts = {}
+    venue_edge_totals = {}
+    for trade in executed:
+        venue = trade.get("venue", "polymarket")
+        venue_counts[venue] = venue_counts.get(venue, 0) + 1
+        venue_edge_totals[venue] = venue_edge_totals.get(venue, 0.0) + abs(trade.get("edge", 0))
 
     # Group by date for a quick summary
     dates = sorted(set(s.get("target_date", "") for s in executed))
     cities = sorted(set(s.get("city", "").replace("_", " ").title() for s in executed))
+    venue_summary = ", ".join(
+        f"{_venue_label(venue)} {count}"
+        for venue, count in sorted(venue_counts.items())
+    )
+    comparison_lines = []
+    if len(venue_counts) > 1:
+        for venue, count in sorted(venue_counts.items()):
+            avg_venue_edge = venue_edge_totals[venue] / count * 100
+            comparison_lines.append(f"{_venue_label(venue)} avg edge {avg_venue_edge:.0f}% across {count} trades")
+    comparison_text = "\n".join(comparison_lines)
 
     # Build compact one-liner per trade
     trade_lines = []
     for s in executed:
+        venue = _venue_label(s.get("venue", "polymarket"))
         city = s.get("city", "?").replace("_", " ").title()
         bucket = _bucket_label_f(s)
         yes_no = _yes_no(s.get("side", "BUY"))
         size = s.get("trade_size", 0)
-        payout = calc_payout(size, s.get("market_prob", 0), s.get("side", "SELL"))
+        payout = calc_payout(
+            size,
+            s.get("market_prob", 0),
+            s.get("side", "SELL"),
+            entry_price=s.get("entry_price"),
+            fee_pct=s.get("fee_pct"),
+            venue=s.get("venue", "polymarket"),
+        )
         edge_pct = abs(s.get("edge", 0)) * 100
         stance = ":handshake:" if not s.get("is_contrarian") else ":eyes:"
         trade_lines.append(
-            f"{stance} {city} | {bucket} | {yes_no} ${size:.0f}\u2192${payout['payout']:.0f} | Edge {edge_pct:.0f}%"
+            f"{stance} {venue} | {city} | {bucket} | {yes_no} ${size:.0f}\u2192${payout['payout']:.0f} | Edge {edge_pct:.0f}%"
         )
 
     # Compact Slack message
@@ -428,9 +565,10 @@ def alert_scan_summary(executed: list[dict], total_signals: int,
         f"{yes_count} YES / {no_count} NO | "
         f"{consensus_count} with crowd / {contrarian_count} against | "
         f"Avg edge {avg_edge:.0f}%\n"
+        f"*Venues:* {venue_summary}\n"
         f"*${total_invested:.0f} invested* | "
         f"*${total_potential:+.0f} potential profit* | "
-        f"${bankroll:.0f} remaining\n"
+        f"Remaining: {bankroll if not isinstance(bankroll, dict) else ', '.join(f'{_venue_label(v)} ${amt:.0f}' for v, amt in sorted(bankroll.items()))}\n"
         f"Markets: {', '.join(_friendly_date(d) for d in dates)} | "
         f"Cities: {', '.join(cities[:6])}"
         f"{'...' if len(cities) > 6 else ''}"
@@ -453,14 +591,22 @@ def alert_scan_summary(executed: list[dict], total_signals: int,
             "type": "section",
             "text": {"type": "mrkdwn", "text": trades_text}
         },
-        {
-            "type": "context",
-            "elements": [{
-                "type": "mrkdwn",
-                "text": f":page_facing_up: Full analysis: `{report_path}`"
-            }]
-        },
     ]
+
+    if comparison_text:
+        blocks.append({"type": "divider"})
+        blocks.append({
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": f"*Venue comparison*\n{comparison_text}"}
+        })
+
+    blocks.append({
+        "type": "context",
+        "elements": [{
+            "type": "mrkdwn",
+            "text": f":page_facing_up: Full analysis: `{report_path}`"
+        }]
+    })
 
     send_slack_blocks(blocks, text=f"{mode_label}: {len(executed)} trades, ${total_invested:.0f} invested")
 
@@ -480,6 +626,10 @@ def alert_daily_summary(stats: dict):
     all_time_wr = stats.get("all_time_win_rate", 0)
     all_time_trades = stats.get("all_time_trades", 0)
     pending = stats.get("pending_trades", 0)
+    venue_counts = {}
+    for detail in details:
+        venue = detail.get("venue", "polymarket")
+        venue_counts[venue] = venue_counts.get(venue, 0) + 1
 
     # Save detailed resolution report
     report_path = ""
@@ -495,20 +645,13 @@ def alert_daily_summary(stats: dict):
     else:
         verdict = ":chart_with_downwards_trend: Rough day"
 
-    # Build compact resolution lines
-    result_lines = []
-    for d in details:
-        emoji = ":white_check_mark:" if d["won"] else ":x:"
-        result_lines.append(
-            f"{emoji} {d['city']} | {d['bucket'][:25]} | "
-            f"Actual: {d['actual_temp_f']:.0f}\u00b0F | "
-            f"${d['pnl']:+.2f}"
-        )
+    results_text, omitted = _build_daily_result_lines(details)
 
     summary_text = (
         f"*{verdict}*\n\n"
         f"*Today:* {resolved} resolved ({wins}W / {losses}L) | "
         f"P&L: *${daily_pnl:+.2f}*\n"
+        f"*By venue:* {', '.join(f'{_venue_label(v)} {c}' for v, c in sorted(venue_counts.items())) or 'None'}\n"
         f"*All-time:* {all_time_trades} trades | "
         f"{all_time_wr:.0%} win rate | "
         f"P&L: *${total_pnl:+.2f}*"
@@ -525,11 +668,11 @@ def alert_daily_summary(stats: dict):
         },
     ]
 
-    if result_lines:
+    if results_text:
         blocks.append({"type": "divider"})
         blocks.append({
             "type": "section",
-            "text": {"type": "mrkdwn", "text": "\n".join(result_lines)}
+            "text": {"type": "mrkdwn", "text": results_text}
         })
 
     footer_parts = []
@@ -537,6 +680,8 @@ def alert_daily_summary(stats: dict):
         footer_parts.append(f":hourglass_flowing_sand: {pending} trades still pending")
     if report_path:
         footer_parts.append(f":page_facing_up: Full report: `{report_path}`")
+    if omitted > 0 and not report_path:
+        footer_parts.append(f"{omitted} more results omitted")
 
     if footer_parts:
         blocks.append({
@@ -544,7 +689,27 @@ def alert_daily_summary(stats: dict):
             "elements": [{"type": "mrkdwn", "text": " | ".join(footer_parts)}]
         })
 
-    send_slack_blocks(blocks, text=f"Daily pulse: ${daily_pnl:+.2f} | {verdict}")
+    preview_text = f"Daily pulse: ${daily_pnl:+.2f} | {verdict}"
+    if send_slack_blocks(blocks, text=preview_text):
+        return
+
+    logger.warning("Daily summary blocks failed, sending plain-text fallback")
+    fallback_text = _build_daily_fallback_text(
+        date=date,
+        verdict=verdict,
+        resolved=resolved,
+        wins=wins,
+        losses=losses,
+        daily_pnl=daily_pnl,
+        total_pnl=total_pnl,
+        all_time_wr=all_time_wr,
+        all_time_trades=all_time_trades,
+        pending=pending,
+        report_path=report_path,
+        venue_counts=venue_counts,
+    )
+    if not send_slack_message(fallback_text):
+        logger.warning("Daily summary fallback message also failed")
 
 
 # ============================================================

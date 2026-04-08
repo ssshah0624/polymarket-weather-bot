@@ -29,6 +29,13 @@ POLYMARKET_FUNDER_ADDRESS = os.getenv("POLYMARKET_FUNDER_ADDRESS", "")
 POLYMARKET_CHAIN_ID = 137  # Polygon mainnet
 
 # ============================================================
+# Kalshi Credentials (live trading only)
+# ============================================================
+KALSHI_API_KEY_ID = os.getenv("KALSHI_API_KEY_ID", "")
+KALSHI_PRIVATE_KEY_PATH = os.getenv("KALSHI_PRIVATE_KEY_PATH", "")
+KALSHI_USE_DEMO = os.getenv("KALSHI_USE_DEMO", "true").lower() == "true"
+
+# ============================================================
 # API Endpoints
 # ============================================================
 GAMMA_API_BASE = "https://gamma-api.polymarket.com"
@@ -36,6 +43,8 @@ CLOB_API_BASE = "https://clob.polymarket.com"
 DATA_API_BASE = "https://data-api.polymarket.com"
 NWS_API_BASE = "https://api.weather.gov"
 ENSEMBLE_API_BASE = "https://ensemble-api.open-meteo.com/v1/ensemble"
+KALSHI_API_BASE = "https://api.elections.kalshi.com/trade-api/v2"
+KALSHI_DEMO_API_BASE = "https://demo-api.kalshi.co/trade-api/v2"
 
 # ============================================================
 # Strategy Parameters
@@ -48,6 +57,11 @@ MIN_VOLUME = float(os.getenv("MIN_VOLUME", "1000"))               # Skip markets
 SCAN_INTERVAL_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "300"))  # 5 minutes
 MAX_FORECAST_DAYS = int(os.getenv("MAX_FORECAST_DAYS", "2"))      # Only trade 1-2 days ahead
 CONTRARIAN_DISCOUNT = float(os.getenv("CONTRARIAN_DISCOUNT", "0.6"))  # Scale down contrarian bets to 60% of normal size
+KALSHI_FEE_BUFFER_PCT = float(os.getenv("KALSHI_FEE_BUFFER_PCT", "0.0"))
+ENABLE_POLYMARKET = os.getenv("ENABLE_POLYMARKET", "true").lower() == "true"
+ENABLE_KALSHI = os.getenv("ENABLE_KALSHI", "true").lower() == "true"
+POLYMARKET_PAPER_BANKROLL = float(os.getenv("POLYMARKET_PAPER_BANKROLL", "1000"))
+KALSHI_PAPER_BANKROLL = float(os.getenv("KALSHI_PAPER_BANKROLL", "1000"))
 
 # ============================================================
 # Cities Configuration — US Only
@@ -58,6 +72,8 @@ CITIES = {
         "lat": 40.7128,
         "lon": -74.0060,
         "polymarket_names": ["new york city", "nyc", "new york"],
+        "kalshi_names": ["new york city", "nyc", "new york"],
+        "kalshi_series_ticker": "KXHIGHNY",
         "nws_available": True,
     },
     "chicago": {
@@ -65,6 +81,8 @@ CITIES = {
         "lat": 41.8781,
         "lon": -87.6298,
         "polymarket_names": ["chicago"],
+        "kalshi_names": ["chicago"],
+        "kalshi_series_ticker": "KXHIGHCHI",
         "nws_available": True,
     },
     "miami": {
@@ -72,6 +90,8 @@ CITIES = {
         "lat": 25.7617,
         "lon": -80.1918,
         "polymarket_names": ["miami"],
+        "kalshi_names": ["miami"],
+        "kalshi_series_ticker": "KXHIGHMIA",
         "nws_available": True,
     },
     "dallas": {
@@ -79,6 +99,8 @@ CITIES = {
         "lat": 32.7767,
         "lon": -96.7970,
         "polymarket_names": ["dallas"],
+        "kalshi_names": ["dallas"],
+        "kalshi_series_ticker": "KXHIGHTDAL",
         "nws_available": True,
     },
     "seattle": {
@@ -86,6 +108,8 @@ CITIES = {
         "lat": 47.6062,
         "lon": -122.3321,
         "polymarket_names": ["seattle"],
+        "kalshi_names": ["seattle"],
+        "kalshi_series_ticker": "KXHIGHTSEA",
         "nws_available": True,
     },
     "atlanta": {
@@ -93,6 +117,8 @@ CITIES = {
         "lat": 33.7490,
         "lon": -84.3880,
         "polymarket_names": ["atlanta"],
+        "kalshi_names": ["atlanta"],
+        "kalshi_series_ticker": "KXHIGHTATL",
         "nws_available": True,
     },
     "austin": {
@@ -100,6 +126,8 @@ CITIES = {
         "lat": 30.2672,
         "lon": -97.7431,
         "polymarket_names": ["austin"],
+        "kalshi_names": ["austin"],
+        "kalshi_series_ticker": "KXHIGHAUS",
         "nws_available": True,
     },
     "denver": {
@@ -107,6 +135,8 @@ CITIES = {
         "lat": 39.7392,
         "lon": -104.9903,
         "polymarket_names": ["denver"],
+        "kalshi_names": ["denver"],
+        "kalshi_series_ticker": "KXHIGHDEN",
         "nws_available": True,
     },
     "houston": {
@@ -114,6 +144,8 @@ CITIES = {
         "lat": 29.7604,
         "lon": -95.3698,
         "polymarket_names": ["houston"],
+        "kalshi_names": ["houston"],
+        "kalshi_series_ticker": "KXHIGHTHOU",
         "nws_available": True,
     },
     "los_angeles": {
@@ -121,6 +153,8 @@ CITIES = {
         "lat": 34.0522,
         "lon": -118.2437,
         "polymarket_names": ["los angeles"],
+        "kalshi_names": ["los angeles", "la"],
+        "kalshi_series_ticker": "KXHIGHLAX",
         "nws_available": True,
     },
     "san_francisco": {
@@ -128,6 +162,8 @@ CITIES = {
         "lat": 37.7749,
         "lon": -122.4194,
         "polymarket_names": ["san francisco"],
+        "kalshi_names": ["san francisco"],
+        "kalshi_series_ticker": "KXHIGHTSFO",
         "nws_available": True,
     },
 }

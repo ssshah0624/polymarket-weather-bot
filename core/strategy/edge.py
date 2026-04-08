@@ -1,12 +1,12 @@
 """
 Edge calculation engine.
-Compares ensemble-derived probabilities against Polymarket prices
+Compares ensemble-derived probabilities against venue prices
 to identify mispriced temperature buckets.
 """
 
 import logging
 from typing import Optional
-from config.settings import EDGE_THRESHOLD
+from config.settings import EDGE_THRESHOLD, KALSHI_FEE_BUFFER_PCT
 
 logger = logging.getLogger(__name__)
 
@@ -16,37 +16,26 @@ WEATHER_FEE_RATE = 0.025
 WEATHER_FEE_EXPONENT = 0.5
 
 
-def calc_fee_pct(price: float) -> float:
-    """Calculate the effective taker fee percentage for a weather market trade."""
+def calc_fee_pct(price: float, venue: str = "polymarket") -> float:
+    """Calculate the effective fee percentage for a venue quote."""
+    if venue == "kalshi":
+        return max(KALSHI_FEE_BUFFER_PCT, 0.0)
     if price <= 0 or price >= 1:
         return 0.0
     return WEATHER_FEE_RATE * (price * (1 - price)) ** WEATHER_FEE_EXPONENT
 
 
-def calculate_edge(ensemble_prob: float, market_prob: float) -> float:
+def calculate_edge(true_prob: float, entry_price: float, fee_pct: float = 0.0) -> float:
     """
-    Calculate the fee-adjusted edge between the model probability and the market price.
+    Calculate the fee-adjusted edge between the model probability and the entry price.
     
-    Positive edge -> ensemble says more likely than market prices -> BUY YES
-    Negative edge -> ensemble says less likely than market prices -> BUY NO / SELL YES
-    
-    The edge is reduced by the effective taker fee so we only trade when
-    the edge exceeds fees.
-    
-    Args:
-        ensemble_prob: Probability from GFS ensemble (0.0 to 1.0)
-        market_prob: Implied probability from Polymarket price (0.0 to 1.0)
-    
-    Returns:
-        Fee-adjusted edge as a float (e.g., 0.15 means 15% edge after fees)
+    Positive edge means the estimated probability exceeds the all-in contract cost.
     """
-    raw_edge = ensemble_prob - market_prob
-    fee = calc_fee_pct(market_prob)
-    # Subtract fee from absolute edge (fees eat into our edge regardless of direction)
+    raw_edge = true_prob - entry_price
     if raw_edge > 0:
-        return raw_edge - fee
+        return raw_edge - fee_pct
     elif raw_edge < 0:
-        return raw_edge + fee  # edge is negative, fee makes it less negative (closer to 0)
+        return raw_edge + fee_pct
     return 0.0
 
 
@@ -76,7 +65,8 @@ def classify_signal(edge: float, threshold: Optional[float] = None) -> str:
 
 
 def analyze_event_buckets(enriched_buckets: list[dict],
-                          threshold: Optional[float] = None) -> list[dict]:
+                          threshold: Optional[float] = None,
+                          venue: str = "polymarket") -> list[dict]:
     """
     Analyze all buckets for an event and attach edge/signal data.
     
@@ -92,7 +82,10 @@ def analyze_event_buckets(enriched_buckets: list[dict],
 
     for bucket in enriched_buckets:
         ens_prob = bucket.get("ensemble_prob")
-        mkt_prob = bucket.get("market_prob", 0.0)
+        yes_price = bucket.get("yes_price", bucket.get("market_prob", 0.0))
+        no_price = bucket.get("no_price")
+        if no_price is None:
+            no_price = max(1.0 - yes_price, 0.0)
 
         if ens_prob is None:
             results.append({
@@ -103,15 +96,41 @@ def analyze_event_buckets(enriched_buckets: list[dict],
             })
             continue
 
-        edge = calculate_edge(ens_prob, mkt_prob)
-        signal = classify_signal(edge, threshold)
-        tradeable = is_tradeable(edge, threshold)
+        yes_fee = calc_fee_pct(yes_price, venue=venue)
+        no_fee = calc_fee_pct(no_price, venue=venue)
+        yes_edge = calculate_edge(ens_prob, yes_price, fee_pct=yes_fee)
+        no_edge = calculate_edge(1 - ens_prob, no_price, fee_pct=no_fee)
+
+        if yes_edge >= no_edge:
+            signed_edge = yes_edge
+            preferred_side = "BUY"
+            selected_price = yes_price
+            selected_prob = ens_prob
+            selected_fee_pct = yes_fee
+        else:
+            signed_edge = -no_edge
+            preferred_side = "SELL"
+            selected_price = no_price
+            selected_prob = 1 - ens_prob
+            selected_fee_pct = no_fee
+
+        signal = classify_signal(signed_edge, threshold)
+        tradeable = is_tradeable(signed_edge, threshold)
 
         results.append({
             **bucket,
-            "edge": edge,
+            "market_prob": yes_price,
+            "yes_price": yes_price,
+            "no_price": no_price,
+            "yes_edge": yes_edge,
+            "no_edge": no_edge,
+            "edge": signed_edge,
             "signal": signal,
             "is_tradeable": tradeable,
+            "preferred_side": preferred_side,
+            "selected_price": selected_price,
+            "selected_prob": selected_prob,
+            "selected_fee_pct": selected_fee_pct,
         })
 
     # Log summary
@@ -121,7 +140,8 @@ def analyze_event_buckets(enriched_buckets: list[dict],
         for r in results:
             if r["is_tradeable"]:
                 logger.info(f"  {r['signal'].upper():>12} | {r['question'][:50]} | "
-                           f"Edge: {r['edge']:+.1%} | Market: {r['market_prob']:.1%} | "
+                           f"Edge: {r['edge']:+.1%} | YES: {r['yes_price']:.1%} | "
+                           f"NO: {r['no_price']:.1%} | "
                            f"Ensemble: {r['ensemble_prob']:.1%}")
 
     return results

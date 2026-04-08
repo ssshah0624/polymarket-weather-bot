@@ -48,9 +48,13 @@ def main():
                       f"Edge: {s['edge']*100:+.1f}%")
 
         status = trader.get_status()
-        print(f"\nBankroll: ${status['bankroll']:.2f}")
+        print(f"\nTotal bankroll: ${status['bankroll']:.2f}")
+        bankrolls = status.get("bankrolls", {})
+        if bankrolls:
+            for venue, amount in sorted(bankrolls.items()):
+                print(f"  {venue}: ${amount:.2f}")
     else:
-        print(f"Starting paper trading bot (bankroll: ${args.bankroll:.2f})")
+        print(f"Starting paper trading bot (per-venue bankroll seed: ${args.bankroll:.2f})")
         print("Press Ctrl+C to stop\n")
         trader.run_loop(interval=args.interval)
 

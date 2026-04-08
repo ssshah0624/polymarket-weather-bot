@@ -10,7 +10,7 @@ set -e
 
 DROPLET="root@161.35.129.129"
 REMOTE_DIR="/opt/polymarket-weather"
-SSH_KEY="$HOME/.ssh/droplet_key"
+SSH_KEY="${SSH_KEY:-}"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 
 # Colors
@@ -21,6 +21,17 @@ NC='\033[0m'
 
 echo -e "${GREEN}=== Polymarket Weather Bot — Safe Deploy ===${NC}"
 echo ""
+
+if [ -z "$SSH_KEY" ]; then
+    if [ -f "$HOME/.ssh/droplet_key" ]; then
+        SSH_KEY="$HOME/.ssh/droplet_key"
+    elif [ -f "$HOME/.ssh/id_ed25519" ]; then
+        SSH_KEY="$HOME/.ssh/id_ed25519"
+    else
+        echo -e "${RED}No SSH key found. Set SSH_KEY or add ~/.ssh/droplet_key or ~/.ssh/id_ed25519${NC}"
+        exit 1
+    fi
+fi
 
 # Step 1: Backup the database on the droplet BEFORE touching anything
 echo -e "${YELLOW}Step 1: Backing up database on droplet...${NC}"
@@ -97,26 +108,47 @@ from sqlalchemy import inspect
 engine = get_engine()
 inspector = inspect(engine)
 
-# Check existing columns
-existing_cols = {col['name'] for col in inspector.get_columns('trades')}
-print(f'Existing trade columns: {len(existing_cols)}')
-
-# Add any new columns that don't exist yet (non-destructive migration)
 import sqlalchemy as sa
-new_columns = {
+trade_columns = {
     'actual_temp': 'FLOAT',
     'fee_usd': 'FLOAT DEFAULT 0.0',
     'resolution_price': 'FLOAT',
+    'venue': \"VARCHAR(30) DEFAULT 'polymarket'\",
+    'venue_event_id': 'VARCHAR(100)',
+    'venue_market_id': 'VARCHAR(100)',
+    'client_order_id': 'VARCHAR(100)',
+    'venue_order_id': 'VARCHAR(100)',
+    'entry_price': 'FLOAT',
+}
+snapshot_columns = {
+    'venue': \"VARCHAR(30) DEFAULT 'polymarket'\",
+    'venue_event_id': 'VARCHAR(100)',
+    'venue_market_id': 'VARCHAR(100)',
+    'yes_price': 'FLOAT',
+    'no_price': 'FLOAT',
 }
 
 with engine.connect() as conn:
-    for col_name, col_type in new_columns.items():
+    existing_cols = {col['name'] for col in inspector.get_columns('trades')}
+    print(f'Existing trade columns: {len(existing_cols)}')
+    for col_name, col_type in trade_columns.items():
         if col_name not in existing_cols:
             conn.execute(sa.text(f'ALTER TABLE trades ADD COLUMN {col_name} {col_type}'))
             conn.commit()
-            print(f'  Added new column: {col_name}')
+            print(f'  Added trade column: {col_name}')
         else:
-            print(f'  Column exists: {col_name}')
+            print(f'  Trade column exists: {col_name}')
+
+    if 'market_snapshots' in inspector.get_table_names():
+        existing_snapshot_cols = {col['name'] for col in inspector.get_columns('market_snapshots')}
+        print(f'Existing snapshot columns: {len(existing_snapshot_cols)}')
+        for col_name, col_type in snapshot_columns.items():
+            if col_name not in existing_snapshot_cols:
+                conn.execute(sa.text(f'ALTER TABLE market_snapshots ADD COLUMN {col_name} {col_type}'))
+                conn.commit()
+                print(f'  Added snapshot column: {col_name}')
+            else:
+                print(f'  Snapshot column exists: {col_name}')
 
 print('Migration complete — no data lost')
 \"

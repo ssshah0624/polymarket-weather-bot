@@ -9,7 +9,12 @@ import logging
 import time
 from datetime import datetime, timezone
 
-from config.settings import TRADING_MODE, SCAN_INTERVAL_SECONDS, MAX_TRADE_SIZE, MAX_DAILY_LOSS
+from config.settings import (
+    KALSHI_PAPER_BANKROLL,
+    MAX_DAILY_LOSS,
+    POLYMARKET_PAPER_BANKROLL,
+    SCAN_INTERVAL_SECONDS,
+)
 from core.strategy.signals import scan_all_markets
 from core.database import log_trade, get_trade_stats, get_traded_buckets
 from core.alerts import (
@@ -23,16 +28,23 @@ from core.alerts import (
 logger = logging.getLogger(__name__)
 
 # Limits
-MAX_POSITIONS = 20
+MAX_POSITIONS_PER_VENUE = 20
 MAX_PER_EVENT = 3
 MIN_BANKROLL = 50.0
 
 
 class PaperTrader:
-    def __init__(self, initial_bankroll: float = 1000.0):
-        self.bankroll = initial_bankroll
-        self.initial_bankroll = initial_bankroll
+    def __init__(self, initial_bankroll: float = 1000.0, venue_bankrolls: dict | None = None):
+        if venue_bankrolls is not None:
+            self.bankrolls = dict(venue_bankrolls)
+        else:
+            self.bankrolls = {
+                "polymarket": POLYMARKET_PAPER_BANKROLL if initial_bankroll == 1000.0 else initial_bankroll,
+                "kalshi": KALSHI_PAPER_BANKROLL if initial_bankroll == 1000.0 else initial_bankroll,
+            }
+        self.initial_bankroll = dict(self.bankrolls)
         self.daily_pnl = 0.0
+        self.daily_pnl_by_venue = {venue: 0.0 for venue in self.bankrolls}
         self.total_pnl = 0.0
         self.trades_today = 0
         self.positions = []
@@ -44,9 +56,12 @@ class PaperTrader:
         Run a single scan cycle. Places trades silently, then sends
         ONE consolidated Slack message at the end.
         """
+        bankroll_text = ", ".join(
+            f"{venue}=${amount:.2f}" for venue, amount in sorted(self.bankrolls.items())
+        )
         logger.info(f"\n{'='*60}")
-        logger.info(f"Paper scan — Bankroll: ${self.bankroll:.2f} | "
-                     f"Positions: {len(self.positions)}/{MAX_POSITIONS}")
+        logger.info(f"Paper scan — Bankrolls: {bankroll_text} | "
+                     f"Positions: {len(self.positions)}")
         logger.info(f"{'='*60}")
 
         # Day rollover
@@ -55,8 +70,9 @@ class PaperTrader:
             self._handle_day_rollover()
             self.current_date = today
 
-        if self.bankroll < MIN_BANKROLL:
-            logger.warning(f"Bankroll too low (${self.bankroll:.2f}), skipping")
+        viable_venues = [venue for venue, amount in self.bankrolls.items() if amount >= MIN_BANKROLL]
+        if not viable_venues:
+            logger.warning("All venue bankrolls are below minimum, skipping")
             return []
 
         if self.daily_pnl < -MAX_DAILY_LOSS:
@@ -66,8 +82,8 @@ class PaperTrader:
         # Scan
         try:
             signals = scan_all_markets(
-                bankroll=self.bankroll,
-                daily_pnl=self.daily_pnl,
+                bankroll=self.bankrolls,
+                daily_pnl=self.daily_pnl_by_venue,
             )
         except Exception as e:
             logger.error(f"Scan failed: {e}", exc_info=True)
@@ -89,7 +105,7 @@ class PaperTrader:
         existing_buckets = get_traded_buckets(mode="paper")
         actionable = [
             s for s in actionable
-            if (s.get("city", ""), s.get("target_date", ""), s.get("bucket_question", ""))
+            if (s.get("venue", "polymarket"), s.get("city", ""), s.get("target_date", ""), s.get("bucket_question", ""))
             not in existing_buckets
         ]
         deduped = total_signals - len(actionable)
@@ -106,21 +122,28 @@ class PaperTrader:
         placed_this_cycle = set()  # Track within this scan cycle to prevent same-cycle dupes
 
         for signal in actionable:
-            if len(self.positions) >= MAX_POSITIONS:
-                logger.info(f"Max positions reached ({MAX_POSITIONS})")
+            venue = signal.get("venue", "polymarket")
+            venue_positions = sum(1 for p in self.positions if p.get("venue") == venue)
+            if venue_positions >= MAX_POSITIONS_PER_VENUE:
+                logger.info(f"Max positions reached for {venue} ({MAX_POSITIONS_PER_VENUE})")
                 break
 
             size = signal.get("trade_size", 0)
-            if size > self.bankroll:
+            if size > self.bankrolls.get(venue, 0):
                 continue
 
             # In-cycle dedup: skip if we already placed this exact bucket in this scan
-            bucket_key = (signal.get("city", ""), signal.get("target_date", ""), signal.get("bucket_question", ""))
+            bucket_key = (
+                venue,
+                signal.get("city", ""),
+                signal.get("target_date", ""),
+                signal.get("bucket_question", ""),
+            )
             if bucket_key in placed_this_cycle:
-                logger.info(f"Skipping in-cycle duplicate: {bucket_key[0]} {bucket_key[2][:40]}")
+                logger.info(f"Skipping in-cycle duplicate: {venue} {signal.get('bucket_question', '')[:40]}")
                 continue
 
-            event_id = signal.get("event_id", "unknown")
+            event_id = (venue, signal.get("event_id", "unknown"))
             event_counts[event_id] = event_counts.get(event_id, 0)
             if event_counts[event_id] >= MAX_PER_EVENT:
                 continue
@@ -135,7 +158,7 @@ class PaperTrader:
             alert_scan_summary(
                 executed=executed,
                 total_signals=total_signals,
-                bankroll=self.bankroll,
+                bankroll=self.bankrolls,
                 mode="paper",
             )
 
@@ -148,29 +171,35 @@ class PaperTrader:
         if size <= 0:
             return False
 
-        self.bankroll -= size
-        self.trades_today += 1
-
+        venue = signal.get("venue", "polymarket")
         yes_no = "YES" if signal.get("side") == "BUY" else "NO"
-
-        self.positions.append({
+        position = {
+            "venue": venue,
             "event_id": signal.get("event_id"),
             "event_title": signal.get("event_title", ""),
             "bucket_question": signal.get("bucket_question", ""),
             "side": signal.get("side"),
             "yes_no": yes_no,
             "size": size,
-            "entry_price": signal.get("market_prob", 0),
+            "entry_price": signal.get("entry_price", signal.get("market_prob", 0)),
             "target_date": signal.get("target_date"),
-        })
+        }
 
         try:
+            self.bankrolls[venue] = self.bankrolls.get(venue, 0.0) - size
+            self.trades_today += 1
+            self.positions.append(position)
             log_trade(signal, mode="paper")
         except Exception as e:
             logger.error(f"Failed to log trade: {e}")
+            self.bankrolls[venue] = self.bankrolls.get(venue, 0.0) + size
+            self.trades_today = max(self.trades_today - 1, 0)
+            if self.positions and self.positions[-1] == position:
+                self.positions.pop()
+            return False
 
         logger.info(
-            f"PAPER: ${size:.2f} on {yes_no} | "
+            f"PAPER [{venue}]: ${size:.2f} on {yes_no} | "
             f"{signal.get('bucket_question', '')[:50]} | "
             f"Edge: {signal.get('edge', 0)*100:+.1f}%"
         )
@@ -185,6 +214,7 @@ class PaperTrader:
         stats["resolved_today"] = 0
         alert_daily_summary(stats)
         self.daily_pnl = 0.0
+        self.daily_pnl_by_venue = {venue: 0.0 for venue in self.daily_pnl_by_venue}
         self.trades_today = 0
 
     def run_loop(self, interval: int = None):
@@ -207,7 +237,8 @@ class PaperTrader:
     def get_status(self) -> dict:
         return {
             "mode": "paper",
-            "bankroll": self.bankroll,
+            "bankroll": sum(self.bankrolls.values()),
+            "bankrolls": dict(self.bankrolls),
             "initial_bankroll": self.initial_bankroll,
             "daily_pnl": self.daily_pnl,
             "total_pnl": self.total_pnl,

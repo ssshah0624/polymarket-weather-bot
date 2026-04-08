@@ -74,7 +74,7 @@ def check_bucket_hit(actual_temp_f: float, bucket_question: str,
     """
     q = bucket_question
     q_lower = q.lower()
-    is_f = "°f" in q_lower or "°F" in q
+    is_f = "°c" not in q_lower and " c" not in q_lower
 
     actual = actual_temp_f
     if not is_f:
@@ -95,6 +95,12 @@ def check_bucket_hit(actual_temp_f: float, bucket_question: str,
 
     # Pattern 3: Standalone hyphenated range "X-Y°F" anywhere in text
     m = re.search(r'(\d+)\s*-\s*(\d+)\s*°', q)
+    if m:
+        low, high = float(m.group(1)), float(m.group(2))
+        return low <= actual < high
+
+    # Pattern 3b: Range using "to", e.g. "70° to 71°"
+    m = re.search(r'(\d+)\s*°?\s*(?:F|C|f|c)?\s*to\s*(\d+)', q)
     if m:
         low, high = float(m.group(1)), float(m.group(2))
         return low <= actual < high
@@ -187,6 +193,7 @@ def resolve_pending_trades(mode: str = "paper") -> dict:
         # Determine win/loss
         side = trade["side"]
         market_price = trade["price"]
+        entry_price = trade.get("entry_price")
         size = trade["size_usd"]
 
         if side == "BUY":
@@ -197,13 +204,12 @@ def resolve_pending_trades(mode: str = "paper") -> dict:
         # Calculate P&L (prediction market math)
         if won:
             if side == "BUY":
-                # Bought YES at market_price, pays $1 per share
-                shares = size / max(market_price, 0.03)
+                share_price = entry_price if entry_price is not None else market_price
+                shares = size / max(share_price, 0.03)
                 pnl = shares - size  # shares * $1 - cost
             else:
-                # Bought NO at (1 - market_price), pays $1 per share
-                no_price = max(1.0 - market_price, 0.03)
-                shares = size / no_price
+                share_price = entry_price if entry_price is not None else max(1.0 - market_price, 0.03)
+                shares = size / max(share_price, 0.03)
                 pnl = shares - size
             pnl = min(pnl, size * 19)  # Cap at 20x
             outcome = "win"
@@ -229,6 +235,7 @@ def resolve_pending_trades(mode: str = "paper") -> dict:
         # Collect details for Slack recap
         city_name = city_config.get("name", city_key.replace("_", " ").title())
         details.append({
+            "venue": trade.get("venue", "polymarket"),
             "city": city_name,
             "target_date": target_date,
             "bucket": trade["bucket_question"],

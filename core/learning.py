@@ -31,6 +31,7 @@ def _get_resolved_trades(days: int = 7, mode: str = "paper") -> list[dict]:
         return [
             {
                 "id": t.id,
+                "venue": t.venue or "polymarket",
                 "city": t.city,
                 "target_date": t.target_date,
                 "side": t.side,
@@ -104,6 +105,16 @@ def analyze_patterns(trades: list[dict]) -> dict:
         else:
             edge_stats[bucket]["losses"] += 1
 
+    venue_stats = defaultdict(lambda: {"wins": 0, "losses": 0, "pnl": 0.0, "trades": 0})
+    for t in trades:
+        venue = t.get("venue", "polymarket")
+        venue_stats[venue]["trades"] += 1
+        venue_stats[venue]["pnl"] += t["pnl"]
+        if t["outcome"] == "win":
+            venue_stats[venue]["wins"] += 1
+        else:
+            venue_stats[venue]["losses"] += 1
+
     # Best and worst cities
     cities_sorted = sorted(city_stats.items(), key=lambda x: x[1]["pnl"], reverse=True)
     best_cities = cities_sorted[:3]
@@ -119,6 +130,7 @@ def analyze_patterns(trades: list[dict]) -> dict:
         "city_stats": dict(city_stats),
         "side_stats": dict(side_stats),
         "edge_stats": dict(edge_stats),
+        "venue_stats": dict(venue_stats),
         "best_cities": best_cities,
         "worst_cities": worst_cities,
     }
@@ -261,12 +273,32 @@ def send_weekly_digest(mode: str = "paper"):
             f"{wr:.0%} win rate, ${stats['pnl']:+.2f}"
         )
 
+    venue_lines = []
+    for venue, stats in sorted(
+        analysis["venue_stats"].items(),
+        key=lambda x: x[1]["pnl"], reverse=True
+    ):
+        wr = stats["wins"] / stats["trades"] if stats["trades"] > 0 else 0
+        venue_lines.append(
+            f"  {venue.title()}: {stats['trades']} trades, {wr:.0%} win rate, ${stats['pnl']:+.2f}"
+        )
+
     if city_lines:
         blocks.append({
             "type": "section",
             "text": {
                 "type": "mrkdwn",
                 "text": "*Top Cities:*\n" + "\n".join(city_lines)
+            }
+        })
+        blocks.append({"type": "divider"})
+
+    if venue_lines:
+        blocks.append({
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": "*By Venue:*\n" + "\n".join(venue_lines)
             }
         })
         blocks.append({"type": "divider"})

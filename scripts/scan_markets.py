@@ -32,7 +32,7 @@ def main():
     args = parser.parse_args()
     setup_logging()
 
-    print("Scanning active Polymarket weather markets...\n")
+    print("Scanning active weather markets across enabled venues...\n")
 
     signals = scan_all_markets(bankroll=1000.0)
 
@@ -49,7 +49,7 @@ def main():
     # Group by event
     events = {}
     for s in signals:
-        key = s.get("event_title", "Unknown")
+        key = f"[{s.get('venue', 'polymarket')}] {s.get('event_title', 'Unknown')}"
         if key not in events:
             events[key] = []
         events[key].append(s)
@@ -68,8 +68,8 @@ def main():
                   f"({nws.get('short_forecast', '')})")
         print(f"{'='*70}")
 
-        print(f"  {'Bucket':<25} {'Market':>8} {'Ensemble':>10} {'Edge':>8} {'Signal':>12} {'Size':>8}")
-        print(f"  {'-'*25} {'-'*8} {'-'*10} {'-'*8} {'-'*12} {'-'*8}")
+        print(f"  {'Bucket':<25} {'YES':>8} {'NO':>8} {'Ensemble':>10} {'Edge':>8} {'Signal':>12} {'Size':>8}")
+        print(f"  {'-'*25} {'-'*8} {'-'*8} {'-'*10} {'-'*8} {'-'*12} {'-'*8}")
 
         for s in sorted(event_signals, key=lambda x: abs(x.get("edge", 0)), reverse=True):
             # Build a clean bucket label from temp range
@@ -85,12 +85,13 @@ def main():
                     q = f"{low:.0f}-{high:.0f}{unit}"
             else:
                 q = s.get("bucket_question", "")[:25]
-            mkt = f"{s.get('market_prob', 0):.1%}"
+            yes_price = f"{s.get('yes_price', s.get('market_prob', 0)):.1%}"
+            no_price = f"{s.get('no_price', max(1 - s.get('market_prob', 0), 0)):.1%}"
             ens = f"{s.get('ensemble_prob', 0):.1%}"
             edge = f"{s.get('edge', 0)*100:+.1f}%"
             sig = s.get("signal", "hold").upper()
             size = f"${s.get('trade_size', 0):.2f}"
-            print(f"  {q:<25} {mkt:>8} {ens:>10} {edge:>8} {sig:>12} {size:>8}")
+            print(f"  {q:<25} {yes_price:>8} {no_price:>8} {ens:>10} {edge:>8} {sig:>12} {size:>8}")
 
     print(f"\nTotal signals: {len(signals)}")
 

@@ -7,18 +7,21 @@ Full trade-by-trade explanations are saved to dated markdown files on the drople
 
 import json
 import logging
+import math
 import requests
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 from config.settings import (
-    KALSHI_FEE_BUFFER_PCT,
     LOG_DIR,
     LOG_LEVEL,
+    PRIMARY_VISIBLE_VENUE,
     PROJECT_ROOT,
+    SLACK_INCLUDE_REPORT_LINKS,
     SLACK_WEBHOOK_URL,
 )
+from core.tuning import get_effective_strategy_params
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +30,8 @@ REPORTS_DIR = PROJECT_ROOT / "data" / "reports"
 SLACK_SECTION_TEXT_LIMIT = 3000
 SLACK_DAILY_RESULTS_CHAR_BUDGET = 2800
 SLACK_DAILY_RESULTS_MAX_LINES = 8
+SLACK_SCAN_BETS_CHAR_BUDGET = 2400
+SLACK_SCAN_BETS_MAX_LINES = 8
 
 
 # ============================================================
@@ -101,7 +106,7 @@ WEATHER_FEE_EXPONENT = 0.5
 def calc_fee_pct(price: float, venue: str = "polymarket") -> float:
     """Effective fee percentage for a venue trade."""
     if venue == "kalshi":
-        return max(KALSHI_FEE_BUFFER_PCT, 0.0)
+        return max(get_effective_strategy_params(venue).get("kalshi_fee_buffer_pct", 0.0), 0.0)
     if price <= 0 or price >= 1:
         return 0.0
     return WEATHER_FEE_RATE * (price * (1 - price)) ** WEATHER_FEE_EXPONENT
@@ -180,12 +185,255 @@ def _venue_label(value: str) -> str:
     return (value or "polymarket").replace("_", " ").title()
 
 
+def _is_slack_visible_venue(value: str) -> bool:
+    return (value or "polymarket") == PRIMARY_VISIBLE_VENUE
+
+
+def _filter_slack_visible_items(items: list[dict]) -> list[dict]:
+    return [item for item in items if _is_slack_visible_venue(item.get("venue"))]
+
+
+def _display_city(value: str) -> str:
+    city = (value or "").replace("_", " ").title()
+    return "NYC" if city == "Nyc" else city
+
+
 def _friendly_date(date_str: str) -> str:
     try:
         dt = datetime.strptime(date_str, "%Y-%m-%d")
         return dt.strftime("%a %b %-d")
     except (ValueError, TypeError):
         return date_str or "?"
+
+
+def _format_temp_value(value: Optional[float]) -> str:
+    if value is None:
+        return "-"
+    return f"{value:.1f}F"
+
+
+def _truncate(value: str, limit: int) -> str:
+    if len(value) <= limit:
+        return value
+    return value[: max(limit - 1, 0)] + "…"
+
+
+def _format_selected_bets(selected_bets: list[dict]) -> str:
+    if not selected_bets:
+        return "-"
+    parts = []
+    for bet in selected_bets:
+        venue = "Poly" if bet.get("venue") == "polymarket" else "Kalshi"
+        bucket = _truncate(bet.get("bucket_question", ""), 16)
+        side = _yes_no(bet.get("side", "BUY"))
+        parts.append(f"{venue} {side} {bucket}")
+    return "; ".join(parts)
+
+
+def _has_meaningful_market_view(row: dict) -> bool:
+    return any(
+        row.get(field) is not None
+        for field in ("model_expected_high", "polymarket_implied_high", "kalshi_implied_high")
+    ) or bool(row.get("selected_bets"))
+
+
+def _select_alert_rows(comparison_rows: list[dict], max_rows: int = 8) -> list[dict]:
+    meaningful = [row for row in comparison_rows if _has_meaningful_market_view(row)]
+    selected = [row for row in meaningful if row.get("selected_bets")]
+    rows = selected or meaningful
+    rows.sort(
+        key=lambda row: (
+            0 if row.get("selected_bets") else 1,
+            row.get("target_date", ""),
+            row.get("city", ""),
+        )
+    )
+    return rows[:max_rows]
+
+
+def _build_comparison_table(comparison_rows: list[dict], max_rows: int = 8) -> str:
+    rows = _select_alert_rows(comparison_rows, max_rows=max_rows)
+    lines = [
+        f"{'City':<12} {'Date':<11} {'Model High':>10} {'Poly':>7} {'Kalshi':>7}  Bets",
+        f"{'-'*12} {'-'*11} {'-'*7} {'-'*7} {'-'*7}  {'-'*24}",
+    ]
+    for row in rows:
+        city = _truncate(row.get("city", "").replace("_", " ").title(), 12)
+        date = row.get("target_date", "")
+        model = _format_temp_value(row.get("model_expected_high"))
+        poly = _format_temp_value(row.get("polymarket_implied_high"))
+        kalshi = _format_temp_value(row.get("kalshi_implied_high"))
+        bets = _truncate(_format_selected_bets(row.get("selected_bets") or []), 48)
+        lines.append(f"{city:<12} {date:<11} {model:>10} {poly:>7} {kalshi:>7}  {bets}")
+    meaningful_count = len([row for row in comparison_rows if _has_meaningful_market_view(row)])
+    if meaningful_count > len(rows):
+        lines.append(f"...and {meaningful_count - len(rows)} more rows in report")
+    return "\n".join(lines)
+
+
+def _build_bets_table(executed: list[dict], max_rows: int = 10) -> str:
+    rows = executed[:max_rows]
+    lines = [
+        f"{'Venue':<10} {'City':<12} {'Side':<4} {'Contract':<16} {'Size':>6} {'Edge':>6}",
+        f"{'-'*10} {'-'*12} {'-'*4} {'-'*16} {'-'*6} {'-'*6}",
+    ]
+    for trade in rows:
+        venue = "Poly" if trade.get("venue") == "polymarket" else "Kalshi"
+        city = _truncate(trade.get("city", "").replace("_", " ").title(), 12)
+        side = _yes_no(trade.get("side", "BUY"))
+        contract = _truncate(_bucket_label_f(trade), 16)
+        size = f"${trade.get('trade_size', 0):.0f}"
+        edge = f"{abs(trade.get('edge', 0))*100:.0f}%"
+        lines.append(f"{venue:<10} {city:<12} {side:<4} {contract:<16} {size:>6} {edge:>6}")
+    if len(executed) > max_rows:
+        lines.append(f"...and {len(executed) - max_rows} more trades in report")
+    return "\n".join(lines)
+
+
+def _sort_executed_for_alert(executed: list[dict]) -> list[dict]:
+    """Show nearby markets together, with the strongest bets first within each date."""
+    return sorted(
+        executed,
+        key=lambda trade: (
+            trade.get("target_date", ""),
+            -abs(trade.get("edge", 0)),
+            trade.get("city", ""),
+            trade.get("venue", ""),
+        ),
+    )
+
+
+def _build_comparison_lookup(comparison_rows: list[dict]) -> dict[tuple[str, str], dict]:
+    return {
+        (row.get("city", ""), row.get("target_date", "")): row
+        for row in comparison_rows
+    }
+
+
+def _selected_market_price(trade: dict) -> Optional[float]:
+    entry_price = trade.get("entry_price")
+    if entry_price is not None:
+        return entry_price
+    market_prob = trade.get("market_prob")
+    if market_prob is None:
+        return None
+    if trade.get("side") == "SELL":
+        return 1.0 - market_prob
+    return market_prob
+
+
+def _market_implied_temp_for_trade(trade: dict, comparison_lookup: dict[tuple[str, str], dict]) -> Optional[float]:
+    row = comparison_lookup.get((trade.get("city", ""), trade.get("target_date", "")))
+    if not row:
+        return None
+    if trade.get("venue") == "kalshi":
+        return row.get("kalshi_implied_high")
+    return row.get("polymarket_implied_high")
+
+
+def _build_trade_reason(trade: dict, comparison_lookup: dict[tuple[str, str], dict]) -> str:
+    model_temp = trade.get("model_expected_high")
+    market_temp = _market_implied_temp_for_trade(trade, comparison_lookup)
+    side = trade.get("side", "BUY")
+    stance = " Against crowd." if trade.get("is_contrarian") else ""
+
+    if model_temp is not None and market_temp is not None:
+        if side == "BUY" and model_temp > market_temp:
+            return (
+                f"Why: model {model_temp:.1f}F vs market-implied {market_temp:.1f}F, "
+                f"so {PRIMARY_VISIBLE_VENUE.title()} looks too cheap on this bucket.{stance}"
+            )
+        if side == "SELL" and model_temp < market_temp:
+            return (
+                f"Why: model {model_temp:.1f}F vs market-implied {market_temp:.1f}F, "
+                f"so {PRIMARY_VISIBLE_VENUE.title()} looks too hot on this bucket.{stance}"
+            )
+
+    model_prob = trade.get("selected_prob")
+    market_price = _selected_market_price(trade)
+    if model_prob is not None and market_price is not None:
+        return (
+            f"Why: model {model_prob:.0%} vs market {market_price:.0%}, "
+            f"so this position looks underpriced.{stance}"
+        )
+
+    edge_pct = abs(trade.get("edge", 0)) * 100
+    return f"Why: the model still shows a {edge_pct:.0f}% edge after fees.{stance}"
+
+
+def _build_trade_alert_entry(trade: dict, comparison_lookup: dict[tuple[str, str], dict]) -> str:
+    city = _display_city(trade.get("city", ""))
+    payout = calc_payout(
+        trade.get("trade_size", 0),
+        trade.get("market_prob", 0),
+        trade.get("side", "SELL"),
+        entry_price=trade.get("entry_price"),
+        fee_pct=trade.get("fee_pct"),
+        venue=trade.get("venue", "polymarket"),
+    )
+    stake_display = math.floor(trade.get("trade_size", 0))
+    payout_display = math.floor(payout.get("payout", 0))
+    return (
+        f"• {_friendly_date(trade.get('target_date', ''))} | {city} | "
+        f"${stake_display} -> ${payout_display} | Edge {abs(trade.get('edge', 0)) * 100:.0f}%\n"
+        f"  Betting {_yes_no(trade.get('side', 'BUY'))} on {_bucket_label_f(trade)}\n"
+        f"  {_build_trade_reason(trade, comparison_lookup)}"
+    )
+
+
+def _build_scan_bets_text(executed: list[dict],
+                          comparison_rows: list[dict],
+                          max_lines: int = SLACK_SCAN_BETS_MAX_LINES,
+                          char_budget: int = SLACK_SCAN_BETS_CHAR_BUDGET) -> tuple[str, int]:
+    entries = []
+    used = 0
+    comparison_lookup = _build_comparison_lookup(comparison_rows)
+
+    for trade in _sort_executed_for_alert(executed)[:max_lines]:
+        entry = _build_trade_alert_entry(trade, comparison_lookup)
+        candidate = "\n\n".join(entries + [entry])
+        if len(candidate) > char_budget:
+            break
+        entries.append(entry)
+        used += 1
+
+    omitted = max(len(executed) - used, 0)
+    if omitted > 0:
+        omission_line = f"...and {omitted} more bets in report"
+        while entries:
+            candidate = "\n\n".join(entries + [omission_line])
+            if len(candidate) <= char_budget:
+                break
+            entries.pop()
+            used -= 1
+            omitted = len(executed) - used
+            omission_line = f"...and {omitted} more bets in report"
+        entries.append(omission_line)
+
+    return "\n\n".join(entries), omitted
+
+
+def _build_comparison_markdown_table(comparison_rows: list[dict]) -> list[str]:
+    meaningful_rows = [row for row in comparison_rows if _has_meaningful_market_view(row)]
+    if not meaningful_rows:
+        return []
+    lines = [
+        "## Market View by City/Date",
+        "",
+        "| City | Date | Model High | Polymarket Implied | Kalshi Implied | Bets Placed |",
+        "|---|---|---:|---:|---:|---|",
+    ]
+    for row in meaningful_rows:
+        city = row.get("city", "").replace("_", " ").title()
+        lines.append(
+            f"| {city} | {row.get('target_date', '')} | "
+            f"{_format_temp_value(row.get('model_expected_high'))} | "
+            f"{_format_temp_value(row.get('polymarket_implied_high'))} | "
+            f"{_format_temp_value(row.get('kalshi_implied_high'))} | "
+            f"{_format_selected_bets(row.get('selected_bets') or [])} |"
+        )
+    lines.append("")
+    return lines
 
 
 def _build_daily_result_lines(details: list[dict],
@@ -196,14 +444,16 @@ def _build_daily_result_lines(details: list[dict],
     used = 0
 
     for detail in details[:max_lines]:
-        emoji = ":white_check_mark:" if detail["won"] else ":x:"
-        venue = _venue_label(detail.get("venue", "polymarket"))
+        outcome = "WON" if detail["won"] else "LOST"
+        actual_temp = f"{detail['actual_temp_f']:.0f}F"
+        payout_display = math.floor(max(detail["size"] + detail["pnl"], 0))
         line = (
-            f"{emoji} {venue} | {detail['city']} | {detail['bucket'][:20]} | "
-            f"Actual: {detail['actual_temp_f']:.0f}\u00b0F | "
-            f"${detail['pnl']:+.2f}"
+            f"• {_display_city(detail['city'])} | ${detail['size']:.0f} -> ${payout_display} | "
+            f"{detail['side']} {detail['bucket'][:20]} | {outcome} | ${detail['pnl']:+.0f}\n"
+            f"  Why: model {detail['ensemble_prob']:.0%} vs market {detail['market_price']:.0%}; "
+            f"actual high was {actual_temp}."
         )
-        candidate = "\n".join(lines + [line])
+        candidate = "\n\n".join(lines + [line])
         if len(candidate) > char_budget:
             break
         lines.append(line)
@@ -213,7 +463,7 @@ def _build_daily_result_lines(details: list[dict],
     if omitted > 0:
         omission_line = f"...and {omitted} more results in report"
         while lines:
-            candidate = "\n".join(lines + [omission_line])
+            candidate = "\n\n".join(lines + [omission_line])
             if len(candidate) <= char_budget:
                 break
             lines.pop()
@@ -222,7 +472,7 @@ def _build_daily_result_lines(details: list[dict],
             omission_line = f"...and {omitted} more results in report"
         lines.append(omission_line)
 
-    return "\n".join(lines), omitted
+    return "\n\n".join(lines), omitted
 
 
 def _build_daily_fallback_text(date: str, verdict: str, resolved: int, wins: int,
@@ -346,7 +596,8 @@ def _build_trade_narrative(sig: dict) -> str:
 
 
 def save_scan_report(executed: list[dict], total_signals: int,
-                     bankroll, mode: str = "paper") -> str:
+                     bankroll, mode: str = "paper",
+                     comparison_rows: Optional[list[dict]] = None) -> str:
     """
     Save a detailed markdown report of the scan to the droplet filesystem.
     Returns the file path.
@@ -405,6 +656,8 @@ def save_scan_report(executed: list[dict], total_signals: int,
         f"| Venues | {', '.join(f'{_venue_label(v)} {c}' for v, c in sorted(venue_counts.items()))} |",
         f"",
     ]
+
+    lines.extend(_build_comparison_markdown_table(comparison_rows or []))
 
     for venue, target_date in sorted(by_venue_date.keys()):
         trades = by_venue_date[(venue, target_date)]
@@ -485,7 +738,8 @@ def save_resolution_report(details: list[dict], summary: dict) -> str:
 # ============================================================
 
 def alert_scan_summary(executed: list[dict], total_signals: int,
-                       bankroll, mode: str = "paper"):
+                       bankroll, mode: str = "paper",
+                       comparison_rows: Optional[list[dict]] = None):
     """
     Send a COMPACT Slack summary (5-8 lines max).
     Full details are in the markdown report on the droplet.
@@ -494,11 +748,15 @@ def alert_scan_summary(executed: list[dict], total_signals: int,
         return
 
     # Save the detailed report first
-    report_path = save_scan_report(executed, total_signals, bankroll, mode)
+    report_path = save_scan_report(executed, total_signals, bankroll, mode, comparison_rows=comparison_rows)
+    executed = _filter_slack_visible_items(executed)
+    if not executed:
+        logger.info("Skipping Slack scan alert because no visible-venue trades were executed")
+        return
 
     mode_label = "PAPER" if mode == "paper" else "LIVE"
     total_invested = sum(s.get("trade_size", 0) for s in executed)
-    total_potential = sum(
+    total_payout = sum(
         calc_payout(
             s.get("trade_size", 0),
             s.get("market_prob", 0),
@@ -506,76 +764,34 @@ def alert_scan_summary(executed: list[dict], total_signals: int,
             entry_price=s.get("entry_price"),
             fee_pct=s.get("fee_pct"),
             venue=s.get("venue", "polymarket"),
-        ).get("profit", 0)
+        ).get("payout", 0)
         for s in executed
     )
     yes_count = sum(1 for s in executed if s.get("side") == "BUY")
     no_count = sum(1 for s in executed if s.get("side") == "SELL")
-    consensus_count = sum(1 for s in executed if not s.get("is_contrarian"))
-    contrarian_count = sum(1 for s in executed if s.get("is_contrarian"))
     avg_edge = sum(abs(s.get("edge", 0)) for s in executed) / len(executed) * 100
-    venue_counts = {}
-    venue_edge_totals = {}
-    for trade in executed:
-        venue = trade.get("venue", "polymarket")
-        venue_counts[venue] = venue_counts.get(venue, 0) + 1
-        venue_edge_totals[venue] = venue_edge_totals.get(venue, 0.0) + abs(trade.get("edge", 0))
 
     # Group by date for a quick summary
     dates = sorted(set(s.get("target_date", "") for s in executed))
-    cities = sorted(set(s.get("city", "").replace("_", " ").title() for s in executed))
-    venue_summary = ", ".join(
-        f"{_venue_label(venue)} {count}"
-        for venue, count in sorted(venue_counts.items())
-    )
-    comparison_lines = []
-    if len(venue_counts) > 1:
-        for venue, count in sorted(venue_counts.items()):
-            avg_venue_edge = venue_edge_totals[venue] / count * 100
-            comparison_lines.append(f"{_venue_label(venue)} avg edge {avg_venue_edge:.0f}% across {count} trades")
-    comparison_text = "\n".join(comparison_lines)
-
-    # Build compact one-liner per trade
-    trade_lines = []
-    for s in executed:
-        venue = _venue_label(s.get("venue", "polymarket"))
-        city = s.get("city", "?").replace("_", " ").title()
-        bucket = _bucket_label_f(s)
-        yes_no = _yes_no(s.get("side", "BUY"))
-        size = s.get("trade_size", 0)
-        payout = calc_payout(
-            size,
-            s.get("market_prob", 0),
-            s.get("side", "SELL"),
-            entry_price=s.get("entry_price"),
-            fee_pct=s.get("fee_pct"),
-            venue=s.get("venue", "polymarket"),
-        )
-        edge_pct = abs(s.get("edge", 0)) * 100
-        stance = ":handshake:" if not s.get("is_contrarian") else ":eyes:"
-        trade_lines.append(
-            f"{stance} {venue} | {city} | {bucket} | {yes_no} ${size:.0f}\u2192${payout['payout']:.0f} | Edge {edge_pct:.0f}%"
-        )
+    cities = sorted(set(_display_city(s.get("city", "")) for s in executed))
+    bets_text, omitted = _build_scan_bets_text(executed, comparison_rows or [])
 
     # Compact Slack message
-    header_text = f"{mode_label} Scan \u2014 {len(executed)} trades placed"
+    header_text = f"{mode_label} Scan \u2014 {len(executed)} {_venue_label(PRIMARY_VISIBLE_VENUE)} trades placed"
 
     summary_text = (
         f"*{len(executed)} trades* | "
         f"{yes_count} YES / {no_count} NO | "
-        f"{consensus_count} with crowd / {contrarian_count} against | "
         f"Avg edge {avg_edge:.0f}%\n"
-        f"*Venues:* {venue_summary}\n"
-        f"*${total_invested:.0f} invested* | "
-        f"*${total_potential:+.0f} potential profit* | "
-        f"Remaining: {bankroll if not isinstance(bankroll, dict) else ', '.join(f'{_venue_label(v)} ${amt:.0f}' for v, amt in sorted(bankroll.items()))}\n"
-        f"Markets: {', '.join(_friendly_date(d) for d in dates)} | "
+        f"${total_invested:.0f} invested | ${math.floor(total_payout):.0f} potential payout\n"
+        f"Markets: {', '.join(_friendly_date(d) for d in dates)}\n"
         f"Cities: {', '.join(cities[:6])}"
         f"{'...' if len(cities) > 6 else ''}"
     )
 
-    # Compact trade list (one line each)
-    trades_text = "\n".join(trade_lines)
+    bets_header = "*Bets placed*"
+    if omitted > 0:
+        bets_header += f" (top {len(executed) - omitted} shown)"
 
     blocks = [
         {
@@ -589,24 +805,18 @@ def alert_scan_summary(executed: list[dict], total_signals: int,
         {"type": "divider"},
         {
             "type": "section",
-            "text": {"type": "mrkdwn", "text": trades_text}
+            "text": {"type": "mrkdwn", "text": f"{bets_header}\n{bets_text}"}
         },
     ]
 
-    if comparison_text:
-        blocks.append({"type": "divider"})
+    if SLACK_INCLUDE_REPORT_LINKS:
         blocks.append({
-            "type": "section",
-            "text": {"type": "mrkdwn", "text": f"*Venue comparison*\n{comparison_text}"}
+            "type": "context",
+            "elements": [{
+                "type": "mrkdwn",
+                "text": f":page_facing_up: Full analysis: `{report_path}`"
+            }]
         })
-
-    blocks.append({
-        "type": "context",
-        "elements": [{
-            "type": "mrkdwn",
-            "text": f":page_facing_up: Full analysis: `{report_path}`"
-        }]
-    })
 
     send_slack_blocks(blocks, text=f"{mode_label}: {len(executed)} trades, ${total_invested:.0f} invested")
 
@@ -617,17 +827,23 @@ def alert_daily_summary(stats: dict):
     Full details saved to markdown report.
     """
     date = stats.get("date", "Today")
-    resolved = stats.get("trades_resolved", 0)
-    daily_pnl = stats.get("daily_pnl", 0)
-    wins = stats.get("wins", 0)
-    losses = stats.get("losses", 0)
     details = stats.get("details", [])
     total_pnl = stats.get("total_pnl", 0)
     all_time_wr = stats.get("all_time_win_rate", 0)
     all_time_trades = stats.get("all_time_trades", 0)
     pending = stats.get("pending_trades", 0)
+    resolved_details = _filter_slack_visible_items(details)
+    if not resolved_details:
+        if details:
+            save_resolution_report(details, stats)
+        return
+
+    resolved = len(resolved_details)
+    daily_pnl = sum(detail.get("pnl", 0.0) for detail in resolved_details)
+    wins = sum(1 for detail in resolved_details if detail.get("won"))
+    losses = sum(1 for detail in resolved_details if not detail.get("won"))
     venue_counts = {}
-    for detail in details:
+    for detail in resolved_details:
         venue = detail.get("venue", "polymarket")
         venue_counts[venue] = venue_counts.get(venue, 0) + 1
 
@@ -645,16 +861,12 @@ def alert_daily_summary(stats: dict):
     else:
         verdict = ":chart_with_downwards_trend: Rough day"
 
-    results_text, omitted = _build_daily_result_lines(details)
+    results_text, omitted = _build_daily_result_lines(resolved_details)
 
     summary_text = (
-        f"*{verdict}*\n\n"
-        f"*Today:* {resolved} resolved ({wins}W / {losses}L) | "
-        f"P&L: *${daily_pnl:+.2f}*\n"
-        f"*By venue:* {', '.join(f'{_venue_label(v)} {c}' for v, c in sorted(venue_counts.items())) or 'None'}\n"
-        f"*All-time:* {all_time_trades} trades | "
-        f"{all_time_wr:.0%} win rate | "
-        f"P&L: *${total_pnl:+.2f}*"
+        f"*{resolved} resolved* | {wins}W / {losses}L | P&L: *${daily_pnl:+.0f}*\n"
+        f"*All-time {_venue_label(PRIMARY_VISIBLE_VENUE)}:* {all_time_trades} trades | "
+        f"{all_time_wr:.0%} win rate | P&L: *${total_pnl:+.0f}*"
     )
 
     blocks = [
@@ -678,7 +890,7 @@ def alert_daily_summary(stats: dict):
     footer_parts = []
     if pending > 0:
         footer_parts.append(f":hourglass_flowing_sand: {pending} trades still pending")
-    if report_path:
+    if report_path and SLACK_INCLUDE_REPORT_LINKS:
         footer_parts.append(f":page_facing_up: Full report: `{report_path}`")
     if omitted > 0 and not report_path:
         footer_parts.append(f"{omitted} more results omitted")
@@ -705,7 +917,7 @@ def alert_daily_summary(stats: dict):
         all_time_wr=all_time_wr,
         all_time_trades=all_time_trades,
         pending=pending,
-        report_path=report_path,
+        report_path=report_path if SLACK_INCLUDE_REPORT_LINKS else "",
         venue_counts=venue_counts,
     )
     if not send_slack_message(fallback_text):

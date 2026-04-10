@@ -20,6 +20,8 @@ TRADING_MODE = os.getenv("TRADING_MODE", "paper")  # backtest | paper | live
 # Slack Alerts
 # ============================================================
 SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "")
+PRIMARY_VISIBLE_VENUE = os.getenv("PRIMARY_VISIBLE_VENUE", "kalshi").lower()
+SLACK_INCLUDE_REPORT_LINKS = os.getenv("SLACK_INCLUDE_REPORT_LINKS", "false").lower() == "true"
 
 # ============================================================
 # Polymarket Credentials (live trading only)
@@ -62,6 +64,7 @@ ENABLE_POLYMARKET = os.getenv("ENABLE_POLYMARKET", "true").lower() == "true"
 ENABLE_KALSHI = os.getenv("ENABLE_KALSHI", "true").lower() == "true"
 POLYMARKET_PAPER_BANKROLL = float(os.getenv("POLYMARKET_PAPER_BANKROLL", "1000"))
 KALSHI_PAPER_BANKROLL = float(os.getenv("KALSHI_PAPER_BANKROLL", "1000"))
+WEATHER_STRATEGY_VERSION = os.getenv("WEATHER_STRATEGY_VERSION", "weather_v2")
 
 # ============================================================
 # Cities Configuration — US Only
@@ -172,6 +175,8 @@ CITIES = {
 # Database
 # ============================================================
 DB_PATH = PROJECT_ROOT / "data" / "trades.db"
+KALSHI_TUNING_OVERRIDES_PATH = PROJECT_ROOT / "data" / "kalshi_tuning.json"
+KALSHI_TUNING_HISTORY_PATH = PROJECT_ROOT / "data" / "kalshi_tuning_history.jsonl"
 
 # ============================================================
 # Logging

@@ -34,6 +34,18 @@ def test_kalshi_range_resolves_with_to_syntax():
     assert check_bucket_hit(71.0, "70° to 71°", "nyc") is False
 
 
+def test_extract_market_city_falls_back_to_series_ticker_when_title_is_generic():
+    market = {
+        "title": "Will the maximum temperature be  >84° on Apr 10, 2026?",
+        "subtitle": None,
+        "yes_sub_title": "85° or above",
+        "event_ticker": "KXHIGHTHOU-26APR10",
+        "series_ticker": "KXHIGHTHOU",
+    }
+
+    assert extract_market_city(market) == "houston"
+
+
 def test_analyze_event_buckets_prefers_no_side_when_no_contract_is_cheaper():
     analyzed = analyze_event_buckets([
         {
@@ -100,3 +112,19 @@ def test_get_active_temperature_events_uses_series_tickers(monkeypatch):
     assert events[0]["city"] == "los_angeles"
     assert events[0]["target_date"] == "2026-04-08"
     assert events[0]["buckets"][0]["yes_price"] == 0.08
+
+
+def test_parse_market_bucket_does_not_misread_chicago_as_celsius():
+    market = {
+        "ticker": "KXHIGHCHI-26APR09-B67.5",
+        "event_ticker": "KXHIGHCHI-26APR09",
+        "title": "Will the high temp in Chicago be 67-68° on Apr 9, 2026?",
+        "yes_bid_dollars": "0.17",
+        "no_bid_dollars": "0.82",
+    }
+
+    bucket = parse_market_bucket(market)
+
+    assert bucket["is_fahrenheit"] is True
+    assert bucket["temp_low"] == 67
+    assert bucket["temp_high"] == 68

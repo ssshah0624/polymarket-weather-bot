@@ -6,7 +6,8 @@ to identify mispriced temperature buckets.
 
 import logging
 from typing import Optional
-from config.settings import EDGE_THRESHOLD, KALSHI_FEE_BUFFER_PCT
+from config.settings import EDGE_THRESHOLD
+from core.tuning import get_effective_strategy_params
 
 logger = logging.getLogger(__name__)
 
@@ -16,10 +17,12 @@ WEATHER_FEE_RATE = 0.025
 WEATHER_FEE_EXPONENT = 0.5
 
 
-def calc_fee_pct(price: float, venue: str = "polymarket") -> float:
+def calc_fee_pct(price: float, venue: str = "polymarket",
+                 strategy_params: dict | None = None) -> float:
     """Calculate the effective fee percentage for a venue quote."""
     if venue == "kalshi":
-        return max(KALSHI_FEE_BUFFER_PCT, 0.0)
+        params = strategy_params or get_effective_strategy_params(venue)
+        return max(params.get("kalshi_fee_buffer_pct", 0.0), 0.0)
     if price <= 0 or price >= 1:
         return 0.0
     return WEATHER_FEE_RATE * (price * (1 - price)) ** WEATHER_FEE_EXPONENT
@@ -66,7 +69,8 @@ def classify_signal(edge: float, threshold: Optional[float] = None) -> str:
 
 def analyze_event_buckets(enriched_buckets: list[dict],
                           threshold: Optional[float] = None,
-                          venue: str = "polymarket") -> list[dict]:
+                          venue: str = "polymarket",
+                          strategy_params: dict | None = None) -> list[dict]:
     """
     Analyze all buckets for an event and attach edge/signal data.
     
@@ -79,6 +83,8 @@ def analyze_event_buckets(enriched_buckets: list[dict],
         List of bucket dicts enriched with 'edge', 'signal', 'is_tradeable' fields.
     """
     results = []
+    params = strategy_params or get_effective_strategy_params(venue)
+    effective_threshold = threshold if threshold is not None else params.get("edge_threshold", EDGE_THRESHOLD)
 
     for bucket in enriched_buckets:
         ens_prob = bucket.get("ensemble_prob")
@@ -96,8 +102,8 @@ def analyze_event_buckets(enriched_buckets: list[dict],
             })
             continue
 
-        yes_fee = calc_fee_pct(yes_price, venue=venue)
-        no_fee = calc_fee_pct(no_price, venue=venue)
+        yes_fee = calc_fee_pct(yes_price, venue=venue, strategy_params=params)
+        no_fee = calc_fee_pct(no_price, venue=venue, strategy_params=params)
         yes_edge = calculate_edge(ens_prob, yes_price, fee_pct=yes_fee)
         no_edge = calculate_edge(1 - ens_prob, no_price, fee_pct=no_fee)
 
@@ -114,8 +120,8 @@ def analyze_event_buckets(enriched_buckets: list[dict],
             selected_prob = 1 - ens_prob
             selected_fee_pct = no_fee
 
-        signal = classify_signal(signed_edge, threshold)
-        tradeable = is_tradeable(signed_edge, threshold)
+        signal = classify_signal(signed_edge, effective_threshold)
+        tradeable = is_tradeable(signed_edge, effective_threshold)
 
         results.append({
             **bucket,

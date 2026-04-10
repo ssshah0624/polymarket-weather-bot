@@ -12,11 +12,17 @@ from datetime import datetime, timezone
 from config.settings import (
     KALSHI_PAPER_BANKROLL,
     MAX_DAILY_LOSS,
+    PRIMARY_VISIBLE_VENUE,
     POLYMARKET_PAPER_BANKROLL,
     SCAN_INTERVAL_SECONDS,
 )
-from core.strategy.signals import scan_all_markets
-from core.database import log_trade, get_trade_stats, get_traded_buckets
+from core.strategy.signals import scan_all_markets, finalize_scan_comparisons
+from core.database import (
+    get_trade_stats,
+    get_traded_buckets,
+    log_trade,
+    log_weather_comparison_snapshot,
+)
 from core.alerts import (
     alert_scan_summary,
     alert_daily_summary,
@@ -81,21 +87,27 @@ class PaperTrader:
 
         # Scan
         try:
-            signals = scan_all_markets(
+            scan_result = scan_all_markets(
                 bankroll=self.bankrolls,
                 daily_pnl=self.daily_pnl_by_venue,
+                return_context=True,
             )
         except Exception as e:
             logger.error(f"Scan failed: {e}", exc_info=True)
             alert_error(str(e), context="Market scan cycle")
             return []
 
+        signals = scan_result.get("signals", [])
+        comparison_rows = scan_result.get("comparisons", [])
+
         if not signals:
+            self._log_comparison_rows(finalize_scan_comparisons(comparison_rows, executed=[]))
             logger.info("No actionable signals found")
             return []
 
         actionable = [s for s in signals if s.get("trade_size", 0) > 0]
         if not actionable:
+            self._log_comparison_rows(finalize_scan_comparisons(comparison_rows, executed=[]))
             logger.info(f"Found {len(signals)} signals but none met sizing criteria")
             return []
 
@@ -113,6 +125,7 @@ class PaperTrader:
             logger.info(f"Filtered out {deduped} duplicate signals (already in DB)")
 
         if not actionable:
+            self._log_comparison_rows(finalize_scan_comparisons(comparison_rows, executed=[]))
             logger.info("All signals already have existing trades")
             return []
 
@@ -154,16 +167,38 @@ class PaperTrader:
                 placed_this_cycle.add(bucket_key)
 
         # Send ONE consolidated Slack message for all trades
+        finalized_comparisons = finalize_scan_comparisons(comparison_rows, executed=executed)
+        self._log_comparison_rows(finalized_comparisons)
         if executed:
+            executed_by_venue = {}
+            for signal in executed:
+                venue = signal.get("venue", "polymarket")
+                executed_by_venue[venue] = executed_by_venue.get(venue, 0) + 1
+            visible_count = executed_by_venue.get(PRIMARY_VISIBLE_VENUE, 0)
+            logger.info(
+                "Executed trades by venue: %s | visible in Slack: %s %s",
+                ", ".join(f"{venue}={count}" for venue, count in sorted(executed_by_venue.items())),
+                visible_count,
+                PRIMARY_VISIBLE_VENUE,
+            )
             alert_scan_summary(
                 executed=executed,
                 total_signals=total_signals,
                 bankroll=self.bankrolls,
                 mode="paper",
+                comparison_rows=finalized_comparisons,
             )
 
         logger.info(f"Executed {len(executed)} paper trades out of {total_signals} signals")
         return executed
+
+    def _log_comparison_rows(self, comparison_rows: list[dict]):
+        """Persist city/date comparison snapshots without breaking the scan loop."""
+        for row in comparison_rows:
+            try:
+                log_weather_comparison_snapshot(row, mode="paper")
+            except Exception as exc:
+                logger.error(f"Failed to log weather comparison snapshot: {exc}", exc_info=True)
 
     def _execute_paper_trade(self, signal: dict) -> bool:
         """Execute a paper trade: deduct bankroll, log to DB. No Slack here."""
@@ -207,10 +242,10 @@ class PaperTrader:
 
     def _handle_day_rollover(self):
         logger.info(f"Day rollover: {self.current_date}")
-        stats = get_trade_stats(mode="paper")
+        stats = get_trade_stats(mode="paper", venue=PRIMARY_VISIBLE_VENUE)
         stats["date"] = self.current_date
         stats["trades_executed"] = self.trades_today
-        stats["daily_pnl"] = self.daily_pnl
+        stats["daily_pnl"] = self.daily_pnl_by_venue.get(PRIMARY_VISIBLE_VENUE, 0.0)
         stats["resolved_today"] = 0
         alert_daily_summary(stats)
         self.daily_pnl = 0.0

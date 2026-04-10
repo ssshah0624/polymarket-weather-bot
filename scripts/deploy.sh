@@ -60,19 +60,16 @@ echo -e "${YELLOW}Step 2: Syncing code to droplet...${NC}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 
-# Create a tarball of code only (no data, no venv, no env)
+# Create a tarball of code only (skip only top-level runtime state)
 cd "$PROJECT_DIR"
-tar -czf /tmp/pw-code-deploy.tar.gz \
-    --exclude='.venv' \
-    --exclude='__pycache__' \
-    --exclude='*.pyc' \
-    --exclude='data' \
-    --exclude='logs' \
-    --exclude='.env' \
-    --exclude='.git' \
-    --exclude='*.db' \
-    --exclude='*.db-journal' \
-    .
+find . -mindepth 1 -maxdepth 1 \
+    ! -name '.venv' \
+    ! -name 'data' \
+    ! -name 'logs' \
+    ! -name '.env' \
+    ! -name '.git' \
+    -print0 \
+    | tar --null -czf /tmp/pw-code-deploy.tar.gz --exclude='__pycache__' --exclude='*.pyc' --files-from=-
 
 scp -i "$SSH_KEY" /tmp/pw-code-deploy.tar.gz "$DROPLET:/tmp/"
 
@@ -119,6 +116,7 @@ trade_columns = {
     'client_order_id': 'VARCHAR(100)',
     'venue_order_id': 'VARCHAR(100)',
     'entry_price': 'FLOAT',
+    'forecast_context_json': 'TEXT',
 }
 snapshot_columns = {
     'venue': \"VARCHAR(30) DEFAULT 'polymarket'\",

@@ -10,7 +10,7 @@ import re
 import requests
 from datetime import datetime, date, timedelta, timezone
 
-from config.settings import CITIES
+from config.settings import CITIES, PRIMARY_VISIBLE_VENUE
 from core.database import get_unresolved_trades, resolve_trade, get_trade_stats
 from core.alerts import alert_daily_summary, alert_error
 
@@ -127,14 +127,14 @@ def check_bucket_hit(actual_temp_f: float, bucket_question: str,
     return None
 
 
-def resolve_pending_trades(mode: str = "paper") -> dict:
+def resolve_pending_trades(mode: str = "paper", venue: str = None) -> dict:
     """
     Main resolution function. Checks all unresolved trades and resolves
     any whose target_date has passed.
 
     Returns summary stats including per-trade details for Slack.
     """
-    trades = get_unresolved_trades(mode=mode)
+    trades = get_unresolved_trades(mode=mode, venue=venue)
     if not trades:
         logger.info("No unresolved trades to check")
         return {"checked": 0, "resolved": 0, "wins": 0, "losses": 0,
@@ -285,7 +285,7 @@ def run_daily_recap(mode: str = "paper"):
     resolution = resolve_pending_trades(mode=mode)
 
     # Get overall stats
-    stats = get_trade_stats(mode=mode)
+    stats = get_trade_stats(mode=mode, venue=PRIMARY_VISIBLE_VENUE)
 
     yesterday = (date.today() - timedelta(days=1)).strftime("%Y-%m-%d")
 

@@ -7,15 +7,31 @@ report exists but the corresponding DB row is missing.
 
 from __future__ import annotations
 
+import json
 import logging
 import re
+from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from config.settings import CITIES, PROJECT_ROOT
+from config.settings import (
+    CITIES,
+    KALSHI_API_KEY_ID,
+    KALSHI_PRIVATE_KEY_PATH,
+    KALSHI_USE_DEMO,
+    PROJECT_ROOT,
+)
 from core.alerts import calc_fee_pct
-from core.database import has_logged_trade, log_trade
+from core.data.kalshi import _event_title, extract_market_city, extract_market_date, parse_market_bucket
+from core.database import (
+    Trade,
+    WeatherComparisonSnapshot,
+    has_logged_trade,
+    log_trade,
+    session_scope,
+)
+from core.execution.kalshi_client import KalshiClient
 
 logger = logging.getLogger(__name__)
 
@@ -232,6 +248,226 @@ def backfill_scan_reports(report_dir: str | Path = REPORTS_DIR,
         "Backfilled %s trades from scan reports for %s (%s skipped duplicates)",
         inserted,
         venue,
+        skipped,
+    )
+    return summary
+
+
+def _has_logged_venue_order(order_id: str, mode: str = "live", venue: str = "kalshi") -> bool:
+    if not order_id:
+        return False
+    with session_scope() as session:
+        existing = session.query(Trade).filter_by(
+            venue=venue,
+            mode=mode,
+            venue_order_id=order_id,
+        ).first()
+        return existing is not None
+
+
+def _latest_snapshot_candidate(city: str, target_date: str, bucket_question: str, side: str, mode: str = "live") -> dict:
+    with session_scope() as session:
+        rows = (
+            session.query(WeatherComparisonSnapshot)
+            .filter_by(mode=mode, city=city, target_date=target_date)
+            .order_by(WeatherComparisonSnapshot.timestamp.desc())
+            .all()
+        )
+        snapshots = [
+            {
+                "candidate_bets_json": row.candidate_bets_json,
+                "model_summary_json": row.model_summary_json,
+                "model_expected_high": row.model_expected_high,
+                "model_spread": row.model_spread,
+                "kalshi_implied_high": row.kalshi_implied_high,
+                "strategy_version": row.strategy_version,
+            }
+            for row in rows
+        ]
+
+    for row in snapshots:
+        try:
+            candidates = json.loads(row["candidate_bets_json"] or "[]")
+            model_summary = json.loads(row["model_summary_json"] or "{}")
+        except json.JSONDecodeError:
+            continue
+        for candidate in candidates:
+            if (
+                candidate.get("venue") == "kalshi"
+                and candidate.get("bucket_question") == bucket_question
+                and candidate.get("side") == side
+            ):
+                return {
+                    "candidate": candidate,
+                    "model_expected_high": row["model_expected_high"],
+                    "model_spread": row["model_spread"],
+                    "venue_implied_high": row["kalshi_implied_high"],
+                    "strategy_version": row["strategy_version"],
+                    "model_summary": model_summary,
+                }
+    return {}
+
+
+def _aggregate_fill_orders(fills: list[dict]) -> list[dict]:
+    grouped: dict[str, dict] = {}
+    for fill in fills:
+        order_id = fill.get("order_id")
+        ticker = fill.get("ticker") or fill.get("market_ticker")
+        side = fill.get("side")
+        if not order_id or not ticker or side not in {"yes", "no"}:
+            continue
+
+        count = float(fill.get("count_fp") or fill.get("count") or 0)
+        yes_price = float(fill.get("yes_price_dollars") or 0)
+        no_price = float(fill.get("no_price_dollars") or 0)
+        fee = float(fill.get("fee_cost") or 0)
+        created_time = fill.get("created_time")
+
+        row = grouped.setdefault(
+            order_id,
+            {
+                "order_id": order_id,
+                "ticker": ticker,
+                "side": side,
+                "contracts": 0.0,
+                "cost": 0.0,
+                "fees": 0.0,
+                "yes_notional": 0.0,
+                "no_notional": 0.0,
+                "first_fill_at": created_time,
+                "last_fill_at": created_time,
+            },
+        )
+        row["contracts"] += count
+        row["cost"] += count * (yes_price if side == "yes" else no_price)
+        row["fees"] += fee
+        row["yes_notional"] += count * yes_price
+        row["no_notional"] += count * no_price
+        if created_time and (row["first_fill_at"] is None or created_time < row["first_fill_at"]):
+            row["first_fill_at"] = created_time
+        if created_time and (row["last_fill_at"] is None or created_time > row["last_fill_at"]):
+            row["last_fill_at"] = created_time
+
+    return list(grouped.values())
+
+
+def backfill_kalshi_live_fills(client: KalshiClient | None = None, limit: int = 200) -> dict:
+    """Backfill missing live Kalshi trades from authenticated fills into the DB."""
+    client = client or KalshiClient(
+        api_key_id=KALSHI_API_KEY_ID,
+        private_key_path=KALSHI_PRIVATE_KEY_PATH,
+        use_demo=KALSHI_USE_DEMO,
+    )
+
+    fills = client.get_fills(limit=limit)
+    aggregated_orders = _aggregate_fill_orders(fills)
+    inserted = 0
+    skipped = 0
+    inserted_trades: list[dict] = []
+    market_cache: dict[str, dict] = {}
+
+    for order in aggregated_orders:
+        order_id = order["order_id"]
+        if _has_logged_venue_order(order_id, mode="live", venue="kalshi"):
+            skipped += 1
+            continue
+
+        ticker = order["ticker"]
+        market = market_cache.get(ticker)
+        if market is None:
+            market = client.get_market(ticker)
+            market_cache[ticker] = market
+
+        city = extract_market_city(market)
+        target_date = extract_market_date(market)
+        bucket = parse_market_bucket(market)
+        if not city or not target_date or not bucket:
+            logger.warning("Skipping Kalshi fill backfill with unparsable market: %s", ticker)
+            skipped += 1
+            continue
+
+        contracts = order["contracts"]
+        if contracts <= 0:
+            skipped += 1
+            continue
+
+        avg_yes_price = order["yes_notional"] / contracts if contracts else 0.0
+        avg_no_price = order["no_notional"] / contracts if contracts else 0.0
+        side = "BUY" if order["side"] == "yes" else "SELL"
+        entry_price = order["cost"] / contracts if contracts else 0.0
+        snapshot_match = _latest_snapshot_candidate(
+            city=city,
+            target_date=target_date,
+            bucket_question=bucket["question"],
+            side=side,
+            mode="live",
+        )
+        candidate = snapshot_match.get("candidate", {})
+        model_summary = snapshot_match.get("model_summary", {})
+        forecast_context = {
+            "source": "kalshi_live_fill_backfill",
+            "selected_prob": candidate.get("model_probability"),
+            "market_prob": avg_yes_price,
+            "entry_price": entry_price,
+            "yes_price": avg_yes_price,
+            "no_price": avg_no_price,
+            "ensemble_mean": snapshot_match.get("model_expected_high"),
+            "ensemble_spread": snapshot_match.get("model_spread"),
+            "ensemble_members": model_summary.get("ensemble_members"),
+            "nws_temp": model_summary.get("nws_temp"),
+            "forecast_horizon_days": model_summary.get("forecast_horizon_days"),
+        }
+        forecast_context = {k: v for k, v in forecast_context.items() if v is not None}
+
+        trade = {
+            "timestamp": order["first_fill_at"],
+            "submitted_at": order["first_fill_at"],
+            "filled_at": order["last_fill_at"],
+            "venue": "kalshi",
+            "event_title": _event_title(market, city, target_date),
+            "event_id": market.get("event_ticker") or ticker,
+            "venue_event_id": market.get("event_ticker") or ticker,
+            "city": city,
+            "target_date": target_date,
+            "bucket_question": bucket["question"],
+            "market_id": ticker,
+            "venue_market_id": ticker,
+            "venue_order_id": order_id,
+            "side": side,
+            "trade_size": round(order["cost"], 2),
+            "intended_size_usd": round(order["cost"], 2),
+            "filled_size_usd": round(order["cost"], 2),
+            "filled_contracts": int(round(contracts)),
+            "market_prob": round(avg_yes_price, 4),
+            "entry_price": round(entry_price, 4),
+            "expected_entry_price": candidate.get("entry_price", round(entry_price, 4)),
+            "fill_price": round(entry_price, 4),
+            "ensemble_prob": candidate.get("model_probability", 0.0),
+            "edge": candidate.get("edge", 0.0),
+            "signal": "live_fill_backfill",
+            "order_status": "executed",
+            "fee_usd": round(order["fees"], 2),
+            "is_contrarian": "crowd" in (candidate.get("rationale") or "").lower() and "against" in (candidate.get("rationale") or "").lower(),
+            "strategy_version": snapshot_match.get("strategy_version") or "live_fill_backfill",
+            "model_expected_high": snapshot_match.get("model_expected_high"),
+            "model_spread": snapshot_match.get("model_spread"),
+            "venue_implied_high": snapshot_match.get("venue_implied_high"),
+            "forecast_context": forecast_context,
+        }
+
+        log_trade(trade, mode="live")
+        inserted += 1
+        inserted_trades.append(trade)
+
+    summary = {
+        "parsed": len(aggregated_orders),
+        "inserted": inserted,
+        "skipped": skipped,
+        "trades": inserted_trades,
+    }
+    logger.info(
+        "Backfilled %s live Kalshi orders from fills (%s skipped)",
+        inserted,
         skipped,
     )
     return summary

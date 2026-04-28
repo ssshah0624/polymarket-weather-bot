@@ -1,0 +1,214 @@
+- main [ref=e2]:
+  - generic [ref=e3]:
+    - link "National Oceanic and Atmospheric Administration" [ref=e4] [cursor=pointer]:
+      - /url: //www.noaa.gov
+      - img "National Oceanic and Atmospheric Administration" [ref=e5]
+    - link "National Weather Service" [ref=e6] [cursor=pointer]:
+      - /url: https://www.weather.gov
+      - img "National Weather Service" [ref=e7]
+    - link "United States Department of Commerce" [ref=e8] [cursor=pointer]:
+      - /url: //www.commerce.gov
+      - img "United States Department of Commerce" [ref=e9]
+  - navigation [ref=e10]:
+    - list [ref=e13]:
+      - listitem [ref=e14]:
+        - link "HOME" [ref=e15] [cursor=pointer]:
+          - /url: //www.weather.gov
+      - listitem [ref=e16]:
+        - link "FORECAST" [ref=e17] [cursor=pointer]:
+          - /url: https://www.weather.gov/forecastmaps/
+          - text: FORECAST
+      - listitem [ref=e19]:
+        - link "PAST WEATHER" [ref=e20] [cursor=pointer]:
+          - /url: https://www.weather.gov/wrh/climate
+          - text: PAST WEATHER
+      - listitem [ref=e22]:
+        - link "SAFETY" [ref=e23] [cursor=pointer]:
+          - /url: https://www.weather.gov/safety/
+          - text: SAFETY
+      - listitem [ref=e25]:
+        - link "INFORMATION" [ref=e26] [cursor=pointer]:
+          - /url: https://www.weather.gov/informationcenter
+          - text: INFORMATION
+      - listitem [ref=e28]:
+        - link "EDUCATION" [ref=e29] [cursor=pointer]:
+          - /url: https://www.weather.gov/education/
+          - text: EDUCATION
+      - listitem [ref=e31]:
+        - link "NEWS" [ref=e32] [cursor=pointer]:
+          - /url: https://www.weather.gov/news
+          - text: NEWS
+      - listitem [ref=e34]:
+        - link "SEARCH" [ref=e35] [cursor=pointer]:
+          - /url: https://www.weather.gov/search/
+          - text: SEARCH
+      - listitem [ref=e37]:
+        - link "ABOUT" [ref=e38] [cursor=pointer]:
+          - /url: https://www.weather.gov/about/
+          - text: ABOUT
+  - generic [ref=e40]:
+    - text: Climatological Report (Daily)
+    - text: Issued by NWS Upton, NY
+    - generic [ref=e41]:
+      - text: Current Version |
+      - link "Previous Version" [ref=e42] [cursor=pointer]:
+        - /url: "?site=NWS&issuedby=NYC&product=CLI&format=TXT&version=2&glossary=0"
+      - text: "|"
+      - link "Graphics & Text" [ref=e43] [cursor=pointer]:
+        - /url: "?site=NWS&issuedby=NYC&product=CLI&format=ci&version=1&glossary=0"
+      - text: "|"
+      - link "Print" [ref=e44] [cursor=pointer]:
+        - /url: javascript:window.print()
+      - text: "|"
+      - link "Product List" [ref=e45] [cursor=pointer]:
+        - /url: product_types.php?site=NWS
+      - text: "|"
+      - link "Glossary On" [ref=e46] [cursor=pointer]:
+        - /url: "?site=NWS&issuedby=NYC&product=CLI&format=TXT&version=1&glossary=1"
+    - generic [ref=e47]:
+      - text: "Versions: 1"
+      - link "2" [ref=e48] [cursor=pointer]:
+        - /url: "?site=NWS&issuedby=NYC&product=CLI&format=TXT&version=2&glossary=0"
+      - link "3" [ref=e49] [cursor=pointer]:
+        - /url: "?site=NWS&issuedby=NYC&product=CLI&format=TXT&version=3&glossary=0"
+      - link "4" [ref=e50] [cursor=pointer]:
+        - /url: "?site=NWS&issuedby=NYC&product=CLI&format=TXT&version=4&glossary=0"
+      - link "5" [ref=e51] [cursor=pointer]:
+        - /url: "?site=NWS&issuedby=NYC&product=CLI&format=TXT&version=5&glossary=0"
+      - link "6" [ref=e52] [cursor=pointer]:
+        - /url: "?site=NWS&issuedby=NYC&product=CLI&format=TXT&version=6&glossary=0"
+      - link "7" [ref=e53] [cursor=pointer]:
+        - /url: "?site=NWS&issuedby=NYC&product=CLI&format=TXT&version=7&glossary=0"
+      - link "8" [ref=e54] [cursor=pointer]:
+        - /url: "?site=NWS&issuedby=NYC&product=CLI&format=TXT&version=8&glossary=0"
+      - link "9" [ref=e55] [cursor=pointer]:
+        - /url: "?site=NWS&issuedby=NYC&product=CLI&format=TXT&version=9&glossary=0"
+      - link "10" [ref=e56] [cursor=pointer]:
+        - /url: "?site=NWS&issuedby=NYC&product=CLI&format=TXT&version=10&glossary=0"
+      - link "11" [ref=e57] [cursor=pointer]:
+        - /url: "?site=NWS&issuedby=NYC&product=CLI&format=TXT&version=11&glossary=0"
+      - link "12" [ref=e58] [cursor=pointer]:
+        - /url: "?site=NWS&issuedby=NYC&product=CLI&format=TXT&version=12&glossary=0"
+      - link "13" [ref=e59] [cursor=pointer]:
+        - /url: "?site=NWS&issuedby=NYC&product=CLI&format=TXT&version=13&glossary=0"
+      - link "14" [ref=e60] [cursor=pointer]:
+        - /url: "?site=NWS&issuedby=NYC&product=CLI&format=TXT&version=14&glossary=0"
+      - link "15" [ref=e61] [cursor=pointer]:
+        - /url: "?site=NWS&issuedby=NYC&product=CLI&format=TXT&version=15&glossary=0"
+      - link "16" [ref=e62] [cursor=pointer]:
+        - /url: "?site=NWS&issuedby=NYC&product=CLI&format=TXT&version=16&glossary=0"
+      - link "17" [ref=e63] [cursor=pointer]:
+        - /url: "?site=NWS&issuedby=NYC&product=CLI&format=TXT&version=17&glossary=0"
+      - link "18" [ref=e64] [cursor=pointer]:
+        - /url: "?site=NWS&issuedby=NYC&product=CLI&format=TXT&version=18&glossary=0"
+      - link "19" [ref=e65] [cursor=pointer]:
+        - /url: "?site=NWS&issuedby=NYC&product=CLI&format=TXT&version=19&glossary=0"
+      - link "20" [ref=e66] [cursor=pointer]:
+        - /url: "?site=NWS&issuedby=NYC&product=CLI&format=TXT&version=20&glossary=0"
+      - link "21" [ref=e67] [cursor=pointer]:
+        - /url: "?site=NWS&issuedby=NYC&product=CLI&format=TXT&version=21&glossary=0"
+      - link "22" [ref=e68] [cursor=pointer]:
+        - /url: "?site=NWS&issuedby=NYC&product=CLI&format=TXT&version=22&glossary=0"
+      - link "23" [ref=e69] [cursor=pointer]:
+        - /url: "?site=NWS&issuedby=NYC&product=CLI&format=TXT&version=23&glossary=0"
+      - link "24" [ref=e70] [cursor=pointer]:
+        - /url: "?site=NWS&issuedby=NYC&product=CLI&format=TXT&version=24&glossary=0"
+      - link "25" [ref=e71] [cursor=pointer]:
+        - /url: "?site=NWS&issuedby=NYC&product=CLI&format=TXT&version=25&glossary=0"
+      - link "26" [ref=e72] [cursor=pointer]:
+        - /url: "?site=NWS&issuedby=NYC&product=CLI&format=TXT&version=26&glossary=0"
+      - link "27" [ref=e73] [cursor=pointer]:
+        - /url: "?site=NWS&issuedby=NYC&product=CLI&format=TXT&version=27&glossary=0"
+      - link "28" [ref=e74] [cursor=pointer]:
+        - /url: "?site=NWS&issuedby=NYC&product=CLI&format=TXT&version=28&glossary=0"
+      - link "29" [ref=e75] [cursor=pointer]:
+        - /url: "?site=NWS&issuedby=NYC&product=CLI&format=TXT&version=29&glossary=0"
+      - link "30" [ref=e76] [cursor=pointer]:
+        - /url: "?site=NWS&issuedby=NYC&product=CLI&format=TXT&version=30&glossary=0"
+      - link "31" [ref=e77] [cursor=pointer]:
+        - /url: "?site=NWS&issuedby=NYC&product=CLI&format=TXT&version=31&glossary=0"
+      - link "32" [ref=e78] [cursor=pointer]:
+        - /url: "?site=NWS&issuedby=NYC&product=CLI&format=TXT&version=32&glossary=0"
+      - link "33" [ref=e79] [cursor=pointer]:
+        - /url: "?site=NWS&issuedby=NYC&product=CLI&format=TXT&version=33&glossary=0"
+      - link "34" [ref=e80] [cursor=pointer]:
+        - /url: "?site=NWS&issuedby=NYC&product=CLI&format=TXT&version=34&glossary=0"
+      - link "35" [ref=e81] [cursor=pointer]:
+        - /url: "?site=NWS&issuedby=NYC&product=CLI&format=TXT&version=35&glossary=0"
+      - link "36" [ref=e82] [cursor=pointer]:
+        - /url: "?site=NWS&issuedby=NYC&product=CLI&format=TXT&version=36&glossary=0"
+      - link "37" [ref=e83] [cursor=pointer]:
+        - /url: "?site=NWS&issuedby=NYC&product=CLI&format=TXT&version=37&glossary=0"
+      - link "38" [ref=e84] [cursor=pointer]:
+        - /url: "?site=NWS&issuedby=NYC&product=CLI&format=TXT&version=38&glossary=0"
+      - link "39" [ref=e85] [cursor=pointer]:
+        - /url: "?site=NWS&issuedby=NYC&product=CLI&format=TXT&version=39&glossary=0"
+      - link "40" [ref=e86] [cursor=pointer]:
+        - /url: "?site=NWS&issuedby=NYC&product=CLI&format=TXT&version=40&glossary=0"
+      - link "41" [ref=e87] [cursor=pointer]:
+        - /url: "?site=NWS&issuedby=NYC&product=CLI&format=TXT&version=41&glossary=0"
+      - link "42" [ref=e88] [cursor=pointer]:
+        - /url: "?site=NWS&issuedby=NYC&product=CLI&format=TXT&version=42&glossary=0"
+      - link "43" [ref=e89] [cursor=pointer]:
+        - /url: "?site=NWS&issuedby=NYC&product=CLI&format=TXT&version=43&glossary=0"
+      - link "44" [ref=e90] [cursor=pointer]:
+        - /url: "?site=NWS&issuedby=NYC&product=CLI&format=TXT&version=44&glossary=0"
+      - link "45" [ref=e91] [cursor=pointer]:
+        - /url: "?site=NWS&issuedby=NYC&product=CLI&format=TXT&version=45&glossary=0"
+      - link "46" [ref=e92] [cursor=pointer]:
+        - /url: "?site=NWS&issuedby=NYC&product=CLI&format=TXT&version=46&glossary=0"
+      - link "47" [ref=e93] [cursor=pointer]:
+        - /url: "?site=NWS&issuedby=NYC&product=CLI&format=TXT&version=47&glossary=0"
+      - link "48" [ref=e94] [cursor=pointer]:
+        - /url: "?site=NWS&issuedby=NYC&product=CLI&format=TXT&version=48&glossary=0"
+      - link "49" [ref=e95] [cursor=pointer]:
+        - /url: "?site=NWS&issuedby=NYC&product=CLI&format=TXT&version=49&glossary=0"
+      - link "50" [ref=e96] [cursor=pointer]:
+        - /url: "?site=NWS&issuedby=NYC&product=CLI&format=TXT&version=50&glossary=0"
+      - separator [ref=e97]
+    - generic [ref=e98]: 278 CDUS41 KOKX 160619 CLINYC CLIMATE REPORT NATIONAL WEATHER SERVICE NEW YORK, NY 219 AM EDT THU APR 16 2026 ................................... ...THE CENTRAL PARK NY CLIMATE SUMMARY FOR APRIL 15 2026... CLIMATE NORMAL PERIOD 1991 TO 2020 CLIMATE RECORD PERIOD 1869 TO 2026 WEATHER ITEM OBSERVED TIME RECORD YEAR NORMAL DEPARTURE LAST VALUE (LST) VALUE VALUE FROM YEAR NORMAL ................................................................... TEMPERATURE (F) YESTERDAY MAXIMUM 90R 214 PM 87 1941 62 28 69 MINIMUM 67 430 AM 28 1943 45 22 48 AVERAGE 79 54 25 59 PRECIPITATION (IN) YESTERDAY 0.00 7.57 2007 0.14 -0.14 0.01 MONTH TO DATE 0.35 2.03 -1.68 2.43 SINCE MAR 1 3.95 6.32 -2.37 7.95 SINCE JAN 1 9.25 13.15 -3.90 11.16 SNOWFALL (IN) YESTERDAY 0.0 T 1943 0.1 -0.1 0.0 1962 2014 MONTH TO DATE 0.0 0.4 -0.4 0.0 SINCE MAR 1 T 5.4 -5.4 0.0 SINCE JUL 1 43.4 29.8 13.6 12.9 SNOW DEPTH 0 DEGREE DAYS HEATING YESTERDAY 0 12 -12 6 MONTH TO DATE 174 217 -43 240 SINCE MAR 1 737 905 -168 795 SINCE JUL 1 4445 4279 166 4056 COOLING YESTERDAY 14 0 14 0 MONTH TO DATE 26 0 26 0 SINCE MAR 1 33 1 32 0 SINCE JAN 1 33 1 32 0 ................................................................... WIND (MPH) HIGHEST WIND SPEED 13 HIGHEST WIND DIRECTION W (250) HIGHEST GUST SPEED 24 HIGHEST GUST DIRECTION SW (230) AVERAGE WIND SPEED 4.9 SKY COVER AVERAGE SKY COVER 0.1 WEATHER CONDITIONS THE FOLLOWING WEATHER WAS RECORDED YESTERDAY. NO SIGNIFICANT WEATHER WAS OBSERVED. RELATIVE HUMIDITY (PERCENT) HIGHEST 68 700 AM LOWEST 39 300 PM AVERAGE 54 .......................................................... THE CENTRAL PARK NY CLIMATE NORMALS FOR TODAY NORMAL RECORD YEAR MAXIMUM TEMPERATURE (F) 62 92 2002 MINIMUM TEMPERATURE (F) 46 29 1928 SUNRISE AND SUNSET APRIL 16 2026.........SUNRISE 615 AM EDT SUNSET 736 PM EDT APRIL 17 2026.........SUNRISE 614 AM EDT SUNSET 738 PM EDT - INDICATES NEGATIVE NUMBERS. R INDICATES RECORD WAS SET OR TIED. MM INDICATES DATA IS MISSING. T INDICATES TRACE AMOUNT. $$
+  - generic [ref=e100]:
+    - link "usa.gov" [ref=e102] [cursor=pointer]:
+      - /url: //www.usa.gov
+      - img "usa.gov" [ref=e103]
+    - list [ref=e105]:
+      - listitem [ref=e106]:
+        - link "US Dept of Commerce" [ref=e107] [cursor=pointer]:
+          - /url: //www.commerce.gov
+      - listitem [ref=e108]:
+        - link "National Oceanic and Atmospheric Administration" [ref=e109] [cursor=pointer]:
+          - /url: //www.noaa.gov
+      - listitem [ref=e110]:
+        - link "National Weather Service" [ref=e111] [cursor=pointer]:
+          - /url: https://www.weather.gov
+      - listitem [ref=e112]: 1325 East West Highway
+      - listitem [ref=e113]: Silver Spring, MD 20910
+      - listitem [ref=e114]:
+        - link "Comments? Questions? Please Contact Us." [ref=e115] [cursor=pointer]:
+          - /url: https://www.weather.gov/Contact
+    - list [ref=e117]:
+      - listitem [ref=e118]:
+        - link "Disclaimer" [ref=e119] [cursor=pointer]:
+          - /url: https://www.weather.gov/disclaimer
+      - listitem [ref=e120]:
+        - link "Information Quality" [ref=e121] [cursor=pointer]:
+          - /url: //www.cio.noaa.gov/services_programs/info_quality.html
+      - listitem [ref=e122]:
+        - link "Help" [ref=e123] [cursor=pointer]:
+          - /url: https://www.weather.gov/help
+      - listitem [ref=e124]:
+        - link "Glossary" [ref=e125] [cursor=pointer]:
+          - /url: //www.weather.gov/glossary
+    - list [ref=e127]:
+      - listitem [ref=e128]:
+        - link "Privacy Policy" [ref=e129] [cursor=pointer]:
+          - /url: https://www.weather.gov/privacy
+      - listitem [ref=e130]:
+        - link "Freedom of Information Act (FOIA)" [ref=e131] [cursor=pointer]:
+          - /url: https://www.noaa.gov/foia-freedom-of-information-act
+      - listitem [ref=e132]:
+        - link "About Us" [ref=e133] [cursor=pointer]:
+          - /url: https://www.weather.gov/about
+      - listitem [ref=e134]:
+        - link "Career Opportunities" [ref=e135] [cursor=pointer]:
+          - /url: https://www.weather.gov/careers

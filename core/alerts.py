@@ -14,6 +14,9 @@ from pathlib import Path
 from typing import Optional
 
 from config.settings import (
+    KALSHI_API_KEY_ID,
+    KALSHI_PRIVATE_KEY_PATH,
+    KALSHI_USE_DEMO,
     LOG_DIR,
     LOG_LEVEL,
     PRIMARY_VISIBLE_VENUE,
@@ -173,7 +176,10 @@ def _bucket_label_f(sig: dict) -> str:
         elif high == 999:
             return f"{low:.0f}\u00b0F or higher"
         else:
-            return f"{low:.0f}-{high:.0f}\u00b0F"
+            display_high = high if (high - low) <= 1 else high - 1
+            if display_high <= low:
+                return f"{low:.0f}\u00b0F"
+            return f"{low:.0f}-{display_high:.0f}\u00b0F"
     return sig.get("bucket_question", "Unknown bucket")[:40]
 
 
@@ -336,8 +342,11 @@ def _build_trade_reason(trade: dict, comparison_lookup: dict[tuple[str, str], di
     market_temp = _market_implied_temp_for_trade(trade, comparison_lookup)
     side = trade.get("side", "BUY")
     stance = " Against crowd." if trade.get("is_contrarian") else ""
+    temp_low = trade.get("temp_low")
+    temp_high = trade.get("temp_high")
+    is_open_ended = temp_low in (-999, -999.0) or temp_high in (999, 999.0)
 
-    if model_temp is not None and market_temp is not None:
+    if (not is_open_ended) and model_temp is not None and market_temp is not None:
         if side == "BUY" and model_temp > market_temp:
             return (
                 f"Why: model {model_temp:.1f}F vs market-implied {market_temp:.1f}F, "
@@ -361,6 +370,63 @@ def _build_trade_reason(trade: dict, comparison_lookup: dict[tuple[str, str], di
     return f"Why: the model still shows a {edge_pct:.0f}% edge after fees.{stance}"
 
 
+def _build_trade_context_line(trade: dict, comparison_lookup: dict[tuple[str, str], dict]) -> Optional[str]:
+    if not (trade.get("is_contrarian") or abs(trade.get("edge", 0)) >= 0.20):
+        return None
+
+    parts = []
+    nws_temp = (trade.get("nws_forecast") or {}).get("temp")
+    if nws_temp is not None:
+        parts.append(f"NWS {nws_temp:.0f}F")
+
+    model_temp = trade.get("model_expected_high")
+    if model_temp is not None:
+        parts.append(f"Ensemble mean {model_temp:.1f}F")
+
+    market_temp = trade.get("venue_implied_high")
+    if market_temp is None:
+        market_temp = _market_implied_temp_for_trade(trade, comparison_lookup)
+    if market_temp is not None:
+        parts.append(f"Market center {market_temp:.1f}F")
+
+    member_count = (trade.get("ensemble_meta") or {}).get("member_count")
+    ensemble_prob = trade.get("ensemble_prob")
+    temp_low = trade.get("temp_low")
+    temp_high = trade.get("temp_high")
+    if member_count and ensemble_prob is not None and temp_low is not None and temp_high is not None:
+        hits = int(round(float(ensemble_prob) * int(member_count)))
+        if temp_low in (-999, -999.0):
+            parts.append(f"{hits}/{member_count} members <= {temp_high:.0f}F")
+        elif temp_high in (999, 999.0):
+            parts.append(f"{hits}/{member_count} members >= {temp_low:.0f}F")
+        else:
+            display_high = temp_high - 1
+            if display_high <= temp_low:
+                parts.append(f"{hits}/{member_count} members at {temp_low:.0f}F")
+            else:
+                parts.append(f"{hits}/{member_count} members in {temp_low:.0f}-{display_high:.0f}F")
+
+    if len(parts) < 2:
+        return None
+    return "Context: " + " | ".join(parts)
+
+
+def _build_live_fill_line(trade: dict) -> Optional[str]:
+    contracts = trade.get("filled_contracts")
+    fill_price = trade.get("fill_price") or trade.get("entry_price")
+    if not contracts or fill_price is None:
+        return None
+
+    line = f"Fill: {int(contracts)} contracts @ {fill_price * 100:.0f}¢"
+    expected = trade.get("expected_entry_price")
+    if expected is not None:
+        drift_cents = (fill_price - expected) * 100.0
+        if abs(drift_cents) >= 1:
+            direction = "+" if drift_cents > 0 else ""
+            line += f" ({direction}{drift_cents:.0f}¢ vs expected)"
+    return line
+
+
 def _build_trade_alert_entry(trade: dict, comparison_lookup: dict[tuple[str, str], dict]) -> str:
     city = _display_city(trade.get("city", ""))
     payout = calc_payout(
@@ -373,12 +439,19 @@ def _build_trade_alert_entry(trade: dict, comparison_lookup: dict[tuple[str, str
     )
     stake_display = math.floor(trade.get("trade_size", 0))
     payout_display = math.floor(payout.get("payout", 0))
-    return (
+    lines = [
         f"• {_friendly_date(trade.get('target_date', ''))} | {city} | "
-        f"${stake_display} -> ${payout_display} | Edge {abs(trade.get('edge', 0)) * 100:.0f}%\n"
-        f"  Betting {_yes_no(trade.get('side', 'BUY'))} on {_bucket_label_f(trade)}\n"
-        f"  {_build_trade_reason(trade, comparison_lookup)}"
-    )
+        f"${stake_display} -> ${payout_display} | Edge {abs(trade.get('edge', 0)) * 100:.0f}%",
+        f"  Betting {_yes_no(trade.get('side', 'BUY'))} on {_bucket_label_f(trade)}",
+    ]
+    live_fill_line = _build_live_fill_line(trade)
+    if live_fill_line:
+        lines.append(f"  {live_fill_line}")
+    lines.append(f"  {_build_trade_reason(trade, comparison_lookup)}")
+    context_line = _build_trade_context_line(trade, comparison_lookup)
+    if context_line:
+        lines.append(f"  {context_line}")
+    return "\n".join(lines)
 
 
 def _build_scan_bets_text(executed: list[dict],
@@ -479,10 +552,12 @@ def _build_daily_fallback_text(date: str, verdict: str, resolved: int, wins: int
                                losses: int, daily_pnl: float, total_pnl: float,
                                all_time_wr: float, all_time_trades: int,
                                pending: int, report_path: str = "",
+                               mode: str = "paper",
                                venue_counts: dict[str, int] | None = None) -> str:
     """Build a plain-text fallback when Slack rejects block payloads."""
+    mode_label = mode.upper()
     lines = [
-        f"*Daily Pulse - {date}*",
+        f"*Daily Pulse ({mode_label}) - {date}*",
         verdict,
         f"Today: {resolved} resolved ({wins}W / {losses}L) | P&L: ${daily_pnl:+.2f}",
         f"All-time: {all_time_trades} trades | {all_time_wr:.0%} win rate | P&L: ${total_pnl:+.2f}",
@@ -495,6 +570,48 @@ def _build_daily_fallback_text(date: str, verdict: str, resolved: int, wins: int
     if report_path:
         lines.append(f"Full report: `{report_path}`")
     return "\n".join(lines)
+
+
+def _get_live_portfolio_value() -> Optional[float]:
+    """Return authenticated Kalshi portfolio value (cash + open market value)."""
+    try:
+        from core.execution.kalshi_client import KalshiClient
+
+        client = KalshiClient(
+            api_key_id=KALSHI_API_KEY_ID,
+            private_key_path=KALSHI_PRIVATE_KEY_PATH,
+            use_demo=KALSHI_USE_DEMO,
+        )
+        balance = client.get_balance()
+        portfolio = client.get_portfolio_exposure()
+        return round(balance.balance_usd + portfolio.market_value_usd, 2)
+    except Exception as exc:
+        logger.warning("Failed to load live portfolio value for Slack recap: %s", exc)
+        return None
+
+
+def _build_live_daily_summary_text(date: str, resolved_details: list[dict]) -> str:
+    """Build the compact morning live W/L recap."""
+    daily_pnl = sum(detail.get("pnl", 0.0) for detail in resolved_details)
+    win_buys = sum(1 for detail in resolved_details if detail.get("won") and detail.get("side") == "YES")
+    win_sells = sum(1 for detail in resolved_details if detail.get("won") and detail.get("side") == "NO")
+    loss_buys = sum(1 for detail in resolved_details if (not detail.get("won")) and detail.get("side") == "YES")
+    loss_sells = sum(1 for detail in resolved_details if (not detail.get("won")) and detail.get("side") == "NO")
+    wins = win_buys + win_sells
+    losses = loss_buys + loss_sells
+    portfolio_value = _get_live_portfolio_value()
+    portfolio_text = (
+        f"${portfolio_value:,.2f}" if portfolio_value is not None else "Unavailable"
+    )
+
+    return "\n".join(
+        [
+            f"Previous day P&L: ${daily_pnl:+.2f}",
+            f"Wins: {wins} ({win_buys} buys, {win_sells} sells)",
+            f"Losses: {losses} ({loss_buys} buys, {loss_sells} sells)",
+            f"Portfolio value: {portfolio_text}",
+        ]
+    )
 
 
 # ============================================================
@@ -827,6 +944,8 @@ def alert_daily_summary(stats: dict):
     Full details saved to markdown report.
     """
     date = stats.get("date", "Today")
+    mode = stats.get("mode", "paper")
+    mode_label = mode.upper()
     details = stats.get("details", [])
     total_pnl = stats.get("total_pnl", 0)
     all_time_wr = stats.get("all_time_win_rate", 0)
@@ -836,6 +955,30 @@ def alert_daily_summary(stats: dict):
     if not resolved_details:
         if details:
             save_resolution_report(details, stats)
+        return
+
+    if mode == "live" and PRIMARY_VISIBLE_VENUE == "kalshi":
+        if details:
+            save_resolution_report(details, stats)
+        live_summary_text = _build_live_daily_summary_text(date, resolved_details)
+        header_text = f"Daily Live W/L — {_friendly_date(date)}"
+        blocks = [
+            {
+                "type": "header",
+                "text": {"type": "plain_text", "text": header_text}
+            },
+            {
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": live_summary_text}
+            },
+        ]
+        preview_text = (
+            f"Daily live W/L ({date}): "
+            f"{live_summary_text.replace(chr(10), ' | ')}"
+        )
+        if send_slack_blocks(blocks, text=preview_text):
+            return
+        send_slack_message(f"*{header_text}*\n{live_summary_text}")
         return
 
     resolved = len(resolved_details)
@@ -872,7 +1015,7 @@ def alert_daily_summary(stats: dict):
     blocks = [
         {
             "type": "header",
-            "text": {"type": "plain_text", "text": f"Daily Pulse \u2014 {date}"}
+            "text": {"type": "plain_text", "text": f"Daily Pulse ({mode_label}) \u2014 {date}"}
         },
         {
             "type": "section",
@@ -901,7 +1044,7 @@ def alert_daily_summary(stats: dict):
             "elements": [{"type": "mrkdwn", "text": " | ".join(footer_parts)}]
         })
 
-    preview_text = f"Daily pulse: ${daily_pnl:+.2f} | {verdict}"
+    preview_text = f"Daily pulse ({mode_label.lower()}): ${daily_pnl:+.2f} | {verdict}"
     if send_slack_blocks(blocks, text=preview_text):
         return
 
@@ -918,6 +1061,7 @@ def alert_daily_summary(stats: dict):
         all_time_trades=all_time_trades,
         pending=pending,
         report_path=report_path if SLACK_INCLUDE_REPORT_LINKS else "",
+        mode=mode,
         venue_counts=venue_counts,
     )
     if not send_slack_message(fallback_text):
@@ -944,7 +1088,7 @@ def alert_bot_started(mode: str):
     text = (
         f":rocket: *Weather Bot Started* ({mode_label})\n"
         f"{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')} | "
-        f"US cities only | 1-2 day forecast horizon | "
+        f"US cities only | venue-specific forecast window | "
         f"Min 8% edge after fees"
     )
     send_slack_message(text)

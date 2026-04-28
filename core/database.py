@@ -7,6 +7,7 @@ import json
 from datetime import date, datetime, timezone
 from pathlib import Path
 from contextlib import contextmanager
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import (
     create_engine, Column, Integer, Float, String, Boolean, DateTime, Text,
@@ -20,6 +21,7 @@ from config.settings import DB_PATH
 logger = logging.getLogger(__name__)
 
 Base = declarative_base()
+TRADING_DAY_TIMEZONE = ZoneInfo("America/New_York")
 
 
 # ============================================================
@@ -47,8 +49,18 @@ class Trade(Base):
     venue_order_id = Column(String(100))
     side = Column(String(4))  # BUY | SELL
     size_usd = Column(Float)
+    intended_size_usd = Column(Float)
+    filled_size_usd = Column(Float)
+    filled_contracts = Column(Integer)
     price = Column(Float)  # market price at time of trade
     entry_price = Column(Float)  # all-in entry price for the selected side
+    expected_entry_price = Column(Float)
+    fill_price = Column(Float)
+    order_status = Column(String(30))
+    submitted_at = Column(DateTime)
+    filled_at = Column(DateTime)
+    rejected_reason = Column(Text)
+    wallet_balance_snapshot = Column(Float)
     ensemble_prob = Column(Float)
     edge = Column(Float)
     kelly_pct = Column(Float)
@@ -59,13 +71,16 @@ class Trade(Base):
     model_expected_high = Column(Float)
     model_spread = Column(Float)
     venue_implied_high = Column(Float)
+    settlement_station = Column(String(120))
     forecast_context_json = Column(Text)
     # Resolution
     resolved = Column(Boolean, default=False)
+    resolved_at = Column(DateTime)
     outcome = Column(String(10))  # win | loss | push
     pnl = Column(Float, default=0.0)
     resolution_price = Column(Float)
     actual_temp = Column(Float)  # actual observed temperature
+    resolution_source = Column(String(80))
 
     __table_args__ = (
         Index("ix_trades_date", "target_date"),
@@ -170,15 +185,28 @@ def _run_schema_migrations(engine):
         "client_order_id": "VARCHAR(100)",
         "venue_order_id": "VARCHAR(100)",
         "entry_price": "FLOAT",
+        "intended_size_usd": "FLOAT",
+        "filled_size_usd": "FLOAT",
+        "filled_contracts": "INTEGER",
+        "expected_entry_price": "FLOAT",
+        "fill_price": "FLOAT",
+        "order_status": "VARCHAR(30)",
+        "submitted_at": "DATETIME",
+        "filled_at": "DATETIME",
+        "rejected_reason": "TEXT",
+        "wallet_balance_snapshot": "FLOAT",
         "fee_usd": "FLOAT DEFAULT 0.0",
         "resolution_price": "FLOAT",
         "actual_temp": "FLOAT",
+        "resolved_at": "DATETIME",
         "is_contrarian": "BOOLEAN DEFAULT 0",
         "strategy_version": "VARCHAR(50)",
         "model_expected_high": "FLOAT",
         "model_spread": "FLOAT",
         "venue_implied_high": "FLOAT",
+        "settlement_station": "VARCHAR(120)",
         "forecast_context_json": "TEXT",
+        "resolution_source": "VARCHAR(80)",
     }
     snapshot_columns = {
         "venue": "VARCHAR(30) DEFAULT 'polymarket'",
@@ -246,7 +274,9 @@ def session_scope():
 
 def log_trade(signal: dict, mode: str = "paper") -> Trade:
     """Log a trade to the database."""
-    fee = signal.get("trade_size", 0) * signal.get("fee_pct", 0.0)
+    fee = signal.get("fee_usd")
+    if fee is None:
+        fee = signal.get("trade_size", 0) * signal.get("fee_pct", 0.0)
     ensemble_meta = signal.get("ensemble_meta") or {}
     nws_forecast = signal.get("nws_forecast") or {}
     forecast_context = signal.get("forecast_context") or {
@@ -265,6 +295,14 @@ def log_trade(signal: dict, mode: str = "paper") -> Trade:
         "nws_temp": nws_forecast.get("temp"),
         "nws_unit": nws_forecast.get("unit"),
         "nws_short_forecast": nws_forecast.get("short_forecast"),
+        "nws_hourly_max_temp": nws_forecast.get("hourly_max_temp"),
+        "nws_hourly_max_hour": nws_forecast.get("hourly_max_hour"),
+        "nws_hourly_source": nws_forecast.get("hourly_source"),
+        "settlement_station": signal.get("settlement_station"),
+        "settlement_station_code": signal.get("settlement_station_code"),
+        "settlement_station_source": signal.get("settlement_station_source"),
+        "forecast_lat": signal.get("forecast_lat"),
+        "forecast_lon": signal.get("forecast_lon"),
         "forecast_generated_at": signal.get("forecast_generated_at"),
     }
     forecast_context = {k: v for k, v in forecast_context.items() if v is not None}
@@ -286,18 +324,26 @@ def log_trade(signal: dict, mode: str = "paper") -> Trade:
             "venue_order_id": signal.get("venue_order_id"),
             "side": signal.get("side", ""),
             "size_usd": signal.get("trade_size", 0),
+            "intended_size_usd": signal.get("intended_size_usd", signal.get("trade_size", 0)),
+            "filled_size_usd": signal.get("filled_size_usd", signal.get("trade_size", 0)),
+            "filled_contracts": signal.get("filled_contracts"),
             "price": signal.get("market_prob", 0),
             "entry_price": signal.get("entry_price"),
+            "expected_entry_price": signal.get("expected_entry_price", signal.get("entry_price")),
+            "fill_price": signal.get("fill_price"),
+            "order_status": signal.get("order_status"),
             "ensemble_prob": signal.get("ensemble_prob", 0),
             "edge": signal.get("edge", 0),
             "kelly_pct": signal.get("kelly_pct", 0),
             "signal": signal.get("signal", ""),
             "fee_usd": fee,
+            "wallet_balance_snapshot": signal.get("wallet_balance_snapshot"),
             "is_contrarian": bool(signal.get("is_contrarian", False)),
             "strategy_version": signal.get("strategy_version"),
             "model_expected_high": signal.get("model_expected_high"),
             "model_spread": signal.get("model_spread"),
             "venue_implied_high": signal.get("venue_implied_high"),
+            "settlement_station": signal.get("settlement_station"),
             "forecast_context_json": json.dumps(forecast_context, sort_keys=True) if forecast_context else None,
         }
         timestamp = signal.get("timestamp")
@@ -310,6 +356,15 @@ def log_trade(signal: dict, mode: str = "paper") -> Trade:
                 trade_kwargs["timestamp"] = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
             except ValueError:
                 pass
+        for field in ("submitted_at", "filled_at"):
+            value = signal.get(field)
+            if isinstance(value, datetime):
+                trade_kwargs[field] = value
+            elif isinstance(value, str):
+                try:
+                    trade_kwargs[field] = datetime.fromisoformat(value.replace("Z", "+00:00"))
+                except ValueError:
+                    pass
         trade = Trade(**trade_kwargs)
         session.add(trade)
         session.flush()
@@ -366,17 +421,24 @@ def get_traded_buckets(mode: str = "paper") -> set:
 
 
 def resolve_trade(trade_id: int, outcome: str, pnl: float,
-                  resolution_price: float = 0.0, actual_temp: float = None):
+                  resolution_price: float = 0.0, actual_temp: float = None,
+                  settlement_station: str | None = None,
+                  resolution_source: str | None = None):
     """Resolve a trade with its outcome."""
     with session_scope() as session:
         trade = session.query(Trade).filter_by(id=trade_id).first()
         if trade:
             trade.resolved = True
+            trade.resolved_at = datetime.now(timezone.utc)
             trade.outcome = outcome
             trade.pnl = pnl
             trade.resolution_price = resolution_price
             if actual_temp is not None:
                 trade.actual_temp = actual_temp
+            if settlement_station is not None:
+                trade.settlement_station = settlement_station
+            if resolution_source is not None:
+                trade.resolution_source = resolution_source
 
 
 def get_unresolved_trades(mode: str = None, venue: str = None) -> list[dict]:
@@ -391,10 +453,16 @@ def get_unresolved_trades(mode: str = None, venue: str = None) -> list[dict]:
             {
                 "id": t.id, "venue": t.venue, "event_title": t.event_title, "city": t.city,
                 "target_date": t.target_date, "bucket_question": t.bucket_question,
+                "venue_market_id": t.venue_market_id,
                 "side": t.side, "size_usd": t.size_usd, "price": t.price,
                 "entry_price": t.entry_price,
+                "fill_price": t.fill_price,
+                "filled_size_usd": t.filled_size_usd,
+                "mode": t.mode,
                 "ensemble_prob": t.ensemble_prob, "edge": t.edge,
                 "fee_usd": t.fee_usd or 0.0,
+                "settlement_station": t.settlement_station,
+                "resolution_source": t.resolution_source,
             }
             for t in q.all()
         ]
@@ -420,6 +488,66 @@ def get_total_pnl(mode: str = "paper", venue: str = None) -> float:
             query = query.filter_by(venue=venue)
         trades = query.all()
         return sum(t.pnl for t in trades)
+
+
+def get_realized_pnl_for_day(day: str, mode: str = "paper", venue: str = None) -> float:
+    """Get realized P&L for trades resolved on a given UTC date."""
+    with session_scope() as session:
+        query = session.query(Trade).filter_by(mode=mode, resolved=True)
+        if venue:
+            query = query.filter_by(venue=venue)
+        trades = [
+            t for t in query.all()
+            if t.resolved_at and t.resolved_at.strftime("%Y-%m-%d") == day
+        ]
+        return sum(t.pnl for t in trades)
+
+
+def _to_trading_day(dt: datetime | None, tz: ZoneInfo = TRADING_DAY_TIMEZONE) -> str | None:
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(tz).strftime("%Y-%m-%d")
+
+
+def get_realized_pnl_for_trading_day(day: str, mode: str = "paper", venue: str = None) -> float:
+    """Get realized P&L for trades resolved on a given America/New_York trading day."""
+    with session_scope() as session:
+        query = session.query(Trade).filter_by(mode=mode, resolved=True)
+        if venue:
+            query = query.filter_by(venue=venue)
+        trades = [t for t in query.all() if _to_trading_day(t.resolved_at) == day]
+        return sum(t.pnl for t in trades)
+
+
+def get_trade_cost_for_trading_day(day: str, mode: str = "paper", venue: str = None) -> float:
+    """Get total deployed trade cost (stake + fees) for a given America/New_York trading day."""
+    with session_scope() as session:
+        query = session.query(Trade).filter_by(mode=mode)
+        if venue:
+            query = query.filter_by(venue=venue)
+        trades = [t for t in query.all() if _to_trading_day(t.timestamp) == day]
+        return sum((t.size_usd or 0.0) + (t.fee_usd or 0.0) for t in trades)
+
+
+def get_trade_count_for_trading_day(day: str, mode: str = "paper", venue: str = None) -> int:
+    """Get total number of trades placed on a given America/New_York trading day."""
+    with session_scope() as session:
+        query = session.query(Trade).filter_by(mode=mode)
+        if venue:
+            query = query.filter_by(venue=venue)
+        return sum(1 for trade in query.all() if _to_trading_day(trade.timestamp) == day)
+
+
+def get_open_exposure_usd(mode: str = "paper", venue: str = None) -> float:
+    """Get total unresolved exposure (stake + fees) in USD."""
+    with session_scope() as session:
+        query = session.query(Trade).filter_by(mode=mode, resolved=False)
+        if venue:
+            query = query.filter_by(venue=venue)
+        trades = query.all()
+        return sum((t.size_usd or 0.0) + (t.fee_usd or 0.0) for t in trades)
 
 
 def get_trade_stats(mode: str = "paper", venue: str = None) -> dict:

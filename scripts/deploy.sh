@@ -73,16 +73,10 @@ find . -mindepth 1 -maxdepth 1 \
 
 scp -i "$SSH_KEY" /tmp/pw-code-deploy.tar.gz "$DROPLET:/tmp/"
 
-# Extract code WITHOUT overwriting data/, logs/, or .env
+# Extract code bundle. Runtime state is already excluded from the archive.
 ssh -i "$SSH_KEY" "$DROPLET" "
     cd $REMOTE_DIR
-    
-    # Extract code files only, preserving data and config
-    tar -xzf /tmp/pw-code-deploy.tar.gz \
-        --exclude='data' \
-        --exclude='logs' \
-        --exclude='.env'
-    
+    tar -xzf /tmp/pw-code-deploy.tar.gz
     rm /tmp/pw-code-deploy.tar.gz
     
     # Ensure directories exist
@@ -116,7 +110,18 @@ trade_columns = {
     'client_order_id': 'VARCHAR(100)',
     'venue_order_id': 'VARCHAR(100)',
     'entry_price': 'FLOAT',
+    'intended_size_usd': 'FLOAT',
+    'filled_size_usd': 'FLOAT',
+    'filled_contracts': 'INTEGER',
+    'expected_entry_price': 'FLOAT',
+    'fill_price': 'FLOAT',
+    'order_status': 'VARCHAR(30)',
+    'submitted_at': 'DATETIME',
+    'filled_at': 'DATETIME',
+    'rejected_reason': 'TEXT',
+    'wallet_balance_snapshot': 'FLOAT',
     'forecast_context_json': 'TEXT',
+    'resolved_at': 'DATETIME',
 }
 snapshot_columns = {
     'venue': \"VARCHAR(30) DEFAULT 'polymarket'\",

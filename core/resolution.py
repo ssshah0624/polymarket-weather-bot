@@ -11,13 +11,14 @@ import requests
 from datetime import datetime, date, timedelta, timezone
 
 from config.settings import CITIES, PRIMARY_VISIBLE_VENUE
+from core.data.nws_climate import get_daily_climate_high
 from core.database import get_unresolved_trades, resolve_trade, get_trade_stats
 from core.alerts import alert_daily_summary, alert_error
 
 logger = logging.getLogger(__name__)
 
 
-def get_actual_high_temp(lat: float, lon: float, target_date: str) -> float | None:
+def get_open_meteo_high_temp(lat: float, lon: float, target_date: str) -> float | None:
     """
     Fetch the actual observed high temperature from Open-Meteo.
     Returns temperature in Fahrenheit, or None if not available yet.
@@ -74,7 +75,9 @@ def check_bucket_hit(actual_temp_f: float, bucket_question: str,
     """
     q = bucket_question
     q_lower = q.lower()
-    is_f = "°c" not in q_lower and " c" not in q_lower
+    has_celsius = bool(re.search(r"(?:°\s*c\b|\bcelsius\b)", q_lower))
+    has_fahrenheit = bool(re.search(r"(?:°\s*f\b|\bfahrenheit\b)", q_lower))
+    is_f = has_fahrenheit or not has_celsius
 
     actual = actual_temp_f
     if not is_f:
@@ -84,25 +87,25 @@ def check_bucket_hit(actual_temp_f: float, bucket_question: str,
     # Pattern 1: "between X° and Y°" or "between X and Y"
     m = re.search(r'between\s+(\d+)\s*°?\s*(?:F|C|f|c)?\s*and\s+(\d+)', q)
     if m:
-        low, high = float(m.group(1)), float(m.group(2))
+        low, high = float(m.group(1)), float(m.group(2)) + 1.0
         return low <= actual < high
 
     # Pattern 2: "be X-Y°F" or "be X - Y°F" (hyphenated range)
     m = re.search(r'be\s+(\d+)\s*-\s*(\d+)\s*°', q)
     if m:
-        low, high = float(m.group(1)), float(m.group(2))
+        low, high = float(m.group(1)), float(m.group(2)) + 1.0
         return low <= actual < high
 
     # Pattern 3: Standalone hyphenated range "X-Y°F" anywhere in text
     m = re.search(r'(\d+)\s*-\s*(\d+)\s*°', q)
     if m:
-        low, high = float(m.group(1)), float(m.group(2))
+        low, high = float(m.group(1)), float(m.group(2)) + 1.0
         return low <= actual < high
 
     # Pattern 3b: Range using "to", e.g. "70° to 71°"
     m = re.search(r'(\d+)\s*°?\s*(?:F|C|f|c)?\s*to\s*(\d+)', q)
     if m:
-        low, high = float(m.group(1)), float(m.group(2))
+        low, high = float(m.group(1)), float(m.group(2)) + 1.0
         return low <= actual < high
 
     # Pattern 4: "X° or below" / "X° or lower"
@@ -170,16 +173,38 @@ def resolve_pending_trades(mode: str = "paper", venue: str = None) -> dict:
             continue
 
         # Fetch actual temperature
-        actual_f = get_actual_high_temp(
-            city_config["lat"], city_config["lon"], target_date
-        )
+        actual_observation = None
+        if trade.get("venue") == "kalshi":
+            climate = get_daily_climate_high(city_key, target_date)
+            if climate:
+                actual_observation = {
+                    "actual_temp_f": climate["actual_temp_f"],
+                    "resolution_source": climate["source"],
+                    "settlement_station": climate["station_name"],
+                }
+            else:
+                logger.info(
+                    f"No NWS CLI report yet for {city_key} on {target_date}, will retry later"
+                )
+                continue
+        else:
+            actual_f = get_open_meteo_high_temp(
+                city_config["lat"], city_config["lon"], target_date
+            )
+            if actual_f is not None:
+                actual_observation = {
+                    "actual_temp_f": actual_f,
+                    "resolution_source": "open_meteo_daily",
+                    "settlement_station": city_config.get("name"),
+                }
 
-        if actual_f is None:
+        if actual_observation is None:
             logger.info(
                 f"No actual temp yet for {city_key} on {target_date}, "
                 f"will retry later"
             )
             continue
+        actual_f = actual_observation["actual_temp_f"]
 
         # Check if the bucket was hit
         in_bucket = check_bucket_hit(actual_f, trade["bucket_question"], city_key)
@@ -193,8 +218,9 @@ def resolve_pending_trades(mode: str = "paper", venue: str = None) -> dict:
         # Determine win/loss
         side = trade["side"]
         market_price = trade["price"]
-        entry_price = trade.get("entry_price")
-        size = trade["size_usd"]
+        entry_price = trade.get("fill_price") or trade.get("entry_price")
+        size = trade.get("filled_size_usd") or trade["size_usd"]
+        fee_usd = trade.get("fee_usd", 0.0) or 0.0
 
         if side == "BUY":
             won = in_bucket  # YES bet wins if bucket was hit
@@ -212,10 +238,11 @@ def resolve_pending_trades(mode: str = "paper", venue: str = None) -> dict:
                 shares = size / max(share_price, 0.03)
                 pnl = shares - size
             pnl = min(pnl, size * 19)  # Cap at 20x
+            pnl -= fee_usd
             outcome = "win"
             wins += 1
         else:
-            pnl = -size
+            pnl = -(size + fee_usd)
             outcome = "loss"
             losses += 1
 
@@ -228,6 +255,8 @@ def resolve_pending_trades(mode: str = "paper", venue: str = None) -> dict:
             pnl=pnl,
             resolution_price=1.0 if in_bucket else 0.0,
             actual_temp=actual_f,
+            settlement_station=actual_observation.get("settlement_station"),
+            resolution_source=actual_observation.get("resolution_source"),
         )
 
         resolved_count += 1
@@ -244,6 +273,8 @@ def resolve_pending_trades(mode: str = "paper", venue: str = None) -> dict:
             "market_price": market_price,
             "ensemble_prob": trade.get("ensemble_prob", 0),
             "actual_temp_f": actual_f,
+            "resolution_source": actual_observation.get("resolution_source"),
+            "settlement_station": actual_observation.get("settlement_station"),
             "in_bucket": in_bucket,
             "won": won,
             "pnl": pnl,
@@ -290,6 +321,7 @@ def run_daily_recap(mode: str = "paper"):
     yesterday = (date.today() - timedelta(days=1)).strftime("%Y-%m-%d")
 
     alert_daily_summary({
+        "mode": mode,
         "date": yesterday,
         "trades_resolved": resolution["resolved"],
         "daily_pnl": resolution["pnl"],

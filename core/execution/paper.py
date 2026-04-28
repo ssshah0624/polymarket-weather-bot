@@ -243,6 +243,7 @@ class PaperTrader:
     def _handle_day_rollover(self):
         logger.info(f"Day rollover: {self.current_date}")
         stats = get_trade_stats(mode="paper", venue=PRIMARY_VISIBLE_VENUE)
+        stats["mode"] = "paper"
         stats["date"] = self.current_date
         stats["trades_executed"] = self.trades_today
         stats["daily_pnl"] = self.daily_pnl_by_venue.get(PRIMARY_VISIBLE_VENUE, 0.0)

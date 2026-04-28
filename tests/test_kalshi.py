@@ -24,14 +24,20 @@ def test_kalshi_market_parsing_extracts_city_date_and_prices():
 
     bucket = parse_market_bucket(market)
     assert bucket["temp_low"] == 70
-    assert bucket["temp_high"] == 71
+    assert bucket["temp_high"] == 72
     assert bucket["yes_price"] == 0.44
     assert bucket["no_price"] == 0.58
 
 
 def test_kalshi_range_resolves_with_to_syntax():
     assert check_bucket_hit(70.4, "70° to 71°", "nyc") is True
-    assert check_bucket_hit(71.0, "70° to 71°", "nyc") is False
+    assert check_bucket_hit(71.0, "70° to 71°", "nyc") is True
+    assert check_bucket_hit(72.0, "70° to 71°", "nyc") is False
+
+
+def test_check_bucket_hit_does_not_misread_chicago_as_celsius():
+    assert check_bucket_hit(79.0, "Will the high temp in Chicago be 78-79° on Apr 13, 2026?", "chicago") is True
+    assert check_bucket_hit(79.0, "Will the high temp in Chicago be 80-81° on Apr 13, 2026?", "chicago") is False
 
 
 def test_extract_market_city_falls_back_to_series_ticker_when_title_is_generic():
@@ -127,4 +133,21 @@ def test_parse_market_bucket_does_not_misread_chicago_as_celsius():
 
     assert bucket["is_fahrenheit"] is True
     assert bucket["temp_low"] == 67
-    assert bucket["temp_high"] == 68
+    assert bucket["temp_high"] == 69
+
+
+def test_parse_market_bucket_prefers_subtitle_when_title_is_generic():
+    market = {
+        "ticker": "KXHIGHAUS-26APR13-B82.5",
+        "event_ticker": "KXHIGHAUS-26APR13",
+        "title": "Highest temperature in Austin on 2026-04-13",
+        "subtitle": "82° to 83°",
+        "yes_bid_dollars": "0.15",
+        "no_bid_dollars": "0.83",
+    }
+
+    bucket = parse_market_bucket(market)
+
+    assert bucket["question"] == "82° to 83°"
+    assert bucket["temp_low"] == 82
+    assert bucket["temp_high"] == 84

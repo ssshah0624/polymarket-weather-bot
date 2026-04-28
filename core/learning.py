@@ -14,8 +14,9 @@ from datetime import date, timedelta
 from collections import defaultdict
 
 from config.settings import PRIMARY_VISIBLE_VENUE
-from core.database import session_scope, Trade
+from core.database import session_scope, Trade, WeatherComparisonSnapshot
 from core.alerts import send_slack_blocks, send_slack_message
+from core.resolution import check_bucket_hit
 from core.tuning import (
     apply_kalshi_tuning,
     evaluate_kalshi_tuning,
@@ -46,6 +47,7 @@ def _get_resolved_trades(days: int = 7, mode: str = "paper", venue: str | None =
                 "venue": t.venue or "polymarket",
                 "city": t.city,
                 "target_date": t.target_date,
+                "bucket_question": t.bucket_question,
                 "side": t.side,
                 "size_usd": t.size_usd,
                 "price": t.price,
@@ -54,6 +56,8 @@ def _get_resolved_trades(days: int = 7, mode: str = "paper", venue: str | None =
                 "outcome": t.outcome,
                 "pnl": t.pnl,
                 "actual_temp": t.actual_temp,
+                "settlement_station": t.settlement_station,
+                "resolution_source": t.resolution_source,
                 "model_expected_high": t.model_expected_high,
                 "forecast_context": json.loads(t.forecast_context_json) if t.forecast_context_json else {},
                 "is_contrarian": bool(t.is_contrarian),
@@ -61,6 +65,206 @@ def _get_resolved_trades(days: int = 7, mode: str = "paper", venue: str | None =
             }
             for t in trades
         ]
+
+
+def _get_weather_comparison_snapshots(days: int = 7, mode: str = "live") -> list[dict]:
+    """Fetch comparison snapshots from the past N target dates."""
+    cutoff = (date.today() - timedelta(days=days)).strftime("%Y-%m-%d")
+    with session_scope() as session:
+        rows = (
+            session.query(WeatherComparisonSnapshot)
+            .filter(
+                WeatherComparisonSnapshot.mode == mode,
+                WeatherComparisonSnapshot.target_date >= cutoff,
+            )
+            .order_by(
+                WeatherComparisonSnapshot.target_date.asc(),
+                WeatherComparisonSnapshot.timestamp.asc(),
+            )
+            .all()
+        )
+        return [
+            {
+                "timestamp": row.timestamp,
+                "mode": row.mode,
+                "strategy_version": row.strategy_version,
+                "city": row.city,
+                "target_date": row.target_date,
+                "model_expected_high": row.model_expected_high,
+                "model_spread": row.model_spread,
+                "model_summary": json.loads(row.model_summary_json or "{}"),
+                "candidate_bets": json.loads(row.candidate_bets_json or "[]"),
+                "selected_bets": json.loads(row.selected_bets_json or "[]"),
+                "skip_reasons": json.loads(row.skip_reasons_json or "[]"),
+            }
+            for row in rows
+        ]
+
+
+def _bucket_signature(bet: dict) -> tuple[str, str]:
+    return (bet.get("bucket_question", ""), bet.get("side", "BUY"))
+
+
+def _estimate_selected_bets_pnl(selected_bets: list[dict], actual_temp: float | None, city: str) -> dict:
+    """Estimate realized gross P&L for a hypothetical selected package."""
+    if actual_temp is None or not selected_bets:
+        return {"pnl": 0.0, "wins": 0, "losses": 0, "trades": 0}
+
+    total_pnl = 0.0
+    wins = 0
+    losses = 0
+    for bet in selected_bets:
+        in_bucket = check_bucket_hit(actual_temp, bet.get("bucket_question", ""), city)
+        if in_bucket is None:
+            continue
+        side = bet.get("side", "BUY")
+        size = float(bet.get("trade_size", 0.0) or 0.0)
+        entry_price = float(bet.get("entry_price", 0.0) or 0.0)
+        if size <= 0 or entry_price <= 0:
+            continue
+
+        won = in_bucket if side == "BUY" else not in_bucket
+        if won:
+            shares = size / max(entry_price, 0.03)
+            pnl = min(shares - size, size * 19)
+            wins += 1
+        else:
+            pnl = -size
+            losses += 1
+        total_pnl += pnl
+
+    return {
+        "pnl": total_pnl,
+        "wins": wins,
+        "losses": losses,
+        "trades": wins + losses,
+    }
+
+
+def analyze_shadow_layer_experiment(days: int = 5, mode: str = "live", venue: str = "kalshi") -> dict:
+    """
+    Compare held next-day live trades against the latest same-day shadow package.
+
+    This evaluates whether a same-day veto or replace layer would have improved
+    outcomes on settled event-days.
+    """
+    resolved = _get_resolved_trades(days=days, mode=mode, venue=venue)
+    snapshots = _get_weather_comparison_snapshots(days=days + 2, mode=mode)
+    if not resolved:
+        return {"cases": [], "summary": {"sample_size": 0}}
+
+    trades_by_key: dict[tuple[str, str], list[dict]] = defaultdict(list)
+    for trade in resolved:
+        if trade.get("venue") != venue:
+            continue
+        if trade.get("resolution_source") == "manual_exit":
+            continue
+        trades_by_key[(trade.get("city", ""), trade.get("target_date", ""))].append(trade)
+
+    snapshots_by_key: dict[tuple[str, str], list[dict]] = defaultdict(list)
+    for row in snapshots:
+        key = (row.get("city", ""), row.get("target_date", ""))
+        snapshots_by_key[key].append(row)
+
+    cases = []
+    for key, held_trades in sorted(trades_by_key.items(), key=lambda item: item[0]):
+        actual_temp = next((t.get("actual_temp") for t in held_trades if t.get("actual_temp") is not None), None)
+        if actual_temp is None:
+            continue
+
+        rows = snapshots_by_key.get(key, [])
+        shadow_rows = [row for row in rows if (row.get("model_summary") or {}).get("shadow_only")]
+        if not shadow_rows:
+            continue
+
+        latest_shadow = shadow_rows[-1]
+        shadow_selected = list(latest_shadow.get("selected_bets") or [])
+        if not shadow_selected:
+            proposed = (latest_shadow.get("model_summary") or {}).get("proposed_selected_bets") or []
+            shadow_selected = list(proposed)
+
+        held_pnl = sum(float(t.get("pnl", 0.0) or 0.0) for t in held_trades)
+        held_signatures = {_bucket_signature(t) for t in held_trades}
+        shadow_signatures = {_bucket_signature(bet) for bet in shadow_selected}
+        same_day_eval = _estimate_selected_bets_pnl(shadow_selected, actual_temp, key[0])
+        no_shadow_package = (latest_shadow.get("model_summary") or {}).get("selected_bets_source") == "no_shadow_package"
+        changed = no_shadow_package or shadow_signatures != held_signatures
+        overlap = bool(held_signatures & shadow_signatures)
+        veto_benefit = -held_pnl if changed else 0.0
+        replace_benefit = same_day_eval["pnl"] - held_pnl if shadow_signatures else 0.0
+
+        cases.append(
+            {
+                "city": key[0],
+                "target_date": key[1],
+                "actual_temp": actual_temp,
+                "held_trades": held_trades,
+                "held_pnl": held_pnl,
+                "held_signatures": sorted(held_signatures),
+                "shadow_selected": shadow_selected,
+                "shadow_signatures": sorted(shadow_signatures),
+                "shadow_hold_overlap": overlap,
+                "shadow_changed": changed,
+                "shadow_selected_source": (latest_shadow.get("model_summary") or {}).get("selected_bets_source"),
+                "shadow_forecast_lead_hours": (latest_shadow.get("model_summary") or {}).get("forecast_lead_hours"),
+                "shadow_forecast_lead_bucket": (latest_shadow.get("model_summary") or {}).get("forecast_lead_bucket"),
+                "shadow_no_package": no_shadow_package,
+                "shadow_pnl_estimate": same_day_eval["pnl"],
+                "shadow_wins": same_day_eval["wins"],
+                "shadow_losses": same_day_eval["losses"],
+                "veto_benefit": veto_benefit,
+                "replace_benefit": replace_benefit,
+            }
+        )
+
+    sample_size = len(cases)
+    hold_pnl = sum(case["held_pnl"] for case in cases)
+    shadow_replace_pnl = sum(case["shadow_pnl_estimate"] for case in cases)
+    veto_pnl = sum(0.0 if case["shadow_changed"] else case["held_pnl"] for case in cases)
+    changed_cases = [case for case in cases if case["shadow_changed"]]
+    replace_wins = sum(1 for case in cases if case["replace_benefit"] > 0)
+    veto_wins = sum(1 for case in changed_cases if case["held_pnl"] < 0)
+
+    recommendation = {
+        "layer": "collect_more_data",
+        "reason": "Not enough settled shadow cases yet.",
+    }
+    if sample_size >= 4:
+        if shadow_replace_pnl > hold_pnl and replace_wins >= max(3, sample_size // 2):
+            recommendation = {
+                "layer": "same_day_replace",
+                "reason": (
+                    f"Latest same-day shadow package outperformed hold on {replace_wins}/{sample_size} settled cases "
+                    f"and improved total P&L by ${shadow_replace_pnl - hold_pnl:+.2f}."
+                ),
+            }
+        elif changed_cases and veto_pnl > hold_pnl and veto_wins >= max(2, len(changed_cases) // 2):
+            recommendation = {
+                "layer": "same_day_veto",
+                "reason": (
+                    f"Zeroing materially changed positions would have improved total P&L by ${veto_pnl - hold_pnl:+.2f} "
+                    f"and avoided losses on {veto_wins}/{len(changed_cases)} changed cases."
+                ),
+            }
+        else:
+            recommendation = {
+                "layer": "no_same_day_layer",
+                "reason": "Neither veto nor replace beat hold strongly enough on the settled sample.",
+            }
+
+    return {
+        "cases": cases,
+        "summary": {
+            "sample_size": sample_size,
+            "changed_cases": len(changed_cases),
+            "hold_pnl": hold_pnl,
+            "shadow_replace_pnl": shadow_replace_pnl,
+            "veto_pnl": veto_pnl,
+            "replace_wins": replace_wins,
+            "veto_wins": veto_wins,
+            "recommendation": recommendation,
+        },
+    }
 
 
 def _bucket_edge(edge: float) -> str:
@@ -532,3 +736,84 @@ def send_weekly_digest(mode: str = "paper"):
         text=f"Weekly {venue_label}: {analysis['wins']}W/{analysis['losses']}L, ${analysis['total_pnl']:+.2f}",
     )
     logger.info("Weekly digest sent to Slack")
+
+
+def send_shadow_experiment_digest(days: int = 5, mode: str = "live", venue: str = "kalshi"):
+    """Send the same-day shadow layer experiment conclusion to Slack."""
+    logger.info("Generating same-day shadow experiment digest...")
+    result = analyze_shadow_layer_experiment(days=days, mode=mode, venue=venue)
+    summary = result["summary"]
+    cases = result["cases"]
+
+    mode_label = mode.upper()
+    venue_label = venue.title()
+    period = f"{(date.today() - timedelta(days=days)).strftime('%b %d')} – {date.today().strftime('%b %d')}"
+    recommendation = summary.get("recommendation") or {}
+
+    if summary.get("sample_size", 0) == 0:
+        send_slack_message(
+            f"*Shadow Layer Experiment ({mode_label}) — {venue_label}*\n"
+            f"Lookback: {period}\n"
+            f"• No settled same-day shadow cases yet.\n"
+            f"• Recommendation: keep logging and re-check later."
+        )
+        return
+
+    example_lines = []
+    for case in sorted(cases, key=lambda item: item["replace_benefit"], reverse=True)[:3]:
+        city = case["city"].replace("_", " ").title()
+        example_lines.append(
+            f"• {city} {case['target_date']}: hold ${case['held_pnl']:+.2f}, "
+            f"replace ${case['shadow_pnl_estimate']:+.2f}, changed={case['shadow_changed']}"
+        )
+
+    blocks = [
+        {
+            "type": "header",
+            "text": {"type": "plain_text", "text": f"Shadow Layer Experiment ({mode_label}) — {venue_label}"}
+        },
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": (
+                    f"*Lookback:* {period}\n"
+                    f"• Settled event-days with same-day shadow: {summary['sample_size']}\n"
+                    f"• Material same-day thesis changes: {summary['changed_cases']}\n"
+                    f"• Hold P&L: ${summary['hold_pnl']:+.2f}\n"
+                    f"• Same-day replace P&L estimate: ${summary['shadow_replace_pnl']:+.2f}\n"
+                    f"• Same-day veto P&L estimate: ${summary['veto_pnl']:+.2f}"
+                )
+            }
+        },
+        {"type": "divider"},
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": (
+                    f"*Recommendation:* `{recommendation.get('layer', 'collect_more_data')}`\n"
+                    f"{recommendation.get('reason', 'No recommendation.')}"
+                )
+            }
+        },
+    ]
+
+    if example_lines:
+        blocks.extend([
+            {"type": "divider"},
+            {
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": "*Examples:*\n" + "\n".join(example_lines)}
+            },
+        ])
+
+    send_slack_blocks(
+        blocks,
+        text=(
+            f"Shadow layer experiment ({mode_label}) — {venue_label}: "
+            f"hold ${summary['hold_pnl']:+.2f}, replace ${summary['shadow_replace_pnl']:+.2f}, "
+            f"recommend {recommendation.get('layer', 'collect_more_data')}"
+        ),
+    )
+    logger.info("Shadow experiment digest sent to Slack")

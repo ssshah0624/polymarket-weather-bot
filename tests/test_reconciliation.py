@@ -80,3 +80,72 @@ def test_backfill_scan_reports_is_idempotent(tmp_path, monkeypatch):
 
     database._engine = None
     database._Session = None
+
+
+class _FakeKalshiClient:
+    def get_fills(self, *, limit=200):
+        return [
+            {
+                "order_id": "order-1",
+                "ticker": "KXHIGHAUS-26APR13-B82.5",
+                "side": "yes",
+                "count": 5,
+                "yes_price_dollars": 0.16,
+                "no_price_dollars": 0.84,
+                "fee_cost": 0.05,
+                "created_time": "2026-04-12T20:00:00Z",
+            },
+            {
+                "order_id": "order-1",
+                "ticker": "KXHIGHAUS-26APR13-B82.5",
+                "side": "yes",
+                "count": 3,
+                "yes_price_dollars": 0.16,
+                "no_price_dollars": 0.84,
+                "fee_cost": 0.03,
+                "created_time": "2026-04-12T20:00:03Z",
+            },
+        ]
+
+    def get_market(self, ticker):
+        assert ticker == "KXHIGHAUS-26APR13-B82.5"
+        return {
+            "ticker": ticker,
+            "event_ticker": "KXHIGHAUS-26APR13",
+            "series_ticker": "KXHIGHAUS",
+            "title": "Highest temperature in Austin on 2026-04-13",
+            "subtitle": "82° to 83°",
+            "yes_ask_dollars": "0.16",
+            "no_ask_dollars": "0.84",
+        }
+
+
+def test_backfill_kalshi_live_fills_is_idempotent(tmp_path, monkeypatch):
+    _reset_test_db(tmp_path, monkeypatch)
+
+    summary = reconciliation.backfill_kalshi_live_fills(client=_FakeKalshiClient())
+    assert summary["parsed"] == 1
+    assert summary["inserted"] == 1
+    assert summary["skipped"] == 0
+
+    second = reconciliation.backfill_kalshi_live_fills(client=_FakeKalshiClient())
+    assert second["parsed"] == 1
+    assert second["inserted"] == 0
+    assert second["skipped"] == 1
+
+    with session_scope() as session:
+        trade = session.query(Trade).one()
+        assert trade.mode == "live"
+        assert trade.venue == "kalshi"
+        assert trade.city == "austin"
+        assert trade.target_date == "2026-04-13"
+        assert trade.venue_order_id == "order-1"
+        assert trade.filled_contracts == 8
+        assert trade.filled_size_usd == 1.28
+        assert trade.fee_usd == 0.08
+        assert trade.entry_price == 0.16
+        assert trade.fill_price == 0.16
+        assert trade.bucket_question == "82° to 83°"
+
+    database._engine = None
+    database._Session = None

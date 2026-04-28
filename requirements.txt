@@ -1,6 +1,7 @@
 # Core
 requests>=2.31.0
 python-dotenv>=1.0.0
+cryptography>=42.0.0
 
 # Data & Analysis
 pandas>=2.1.0

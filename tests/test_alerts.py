@@ -77,6 +77,7 @@ def test_alert_daily_summary_falls_back_to_plain_text(monkeypatch):
     monkeypatch.setattr(alerts, "send_slack_message", fake_message)
 
     alerts.alert_daily_summary({
+        "mode": "paper",
         "date": "2026-04-05",
         "trades_resolved": 20,
         "daily_pnl": -31.72,
@@ -94,8 +95,45 @@ def test_alert_daily_summary_falls_back_to_plain_text(monkeypatch):
     assert len(results_block) <= alerts.SLACK_DAILY_RESULTS_CHAR_BUDGET
     assert "...and" in results_block
     assert sent["text"] is not None
-    assert "Daily Pulse - 2026-04-05" in sent["text"]
+    assert "Daily Pulse (PAPER) - 2026-04-05" in sent["text"]
     assert "/tmp/resolution_2026-04-05.md" not in sent["text"]
+
+
+def test_alert_daily_summary_live_falls_back_to_plain_text(monkeypatch):
+    sent = {"blocks": None, "text": None}
+
+    def fake_report(details, stats):
+        return "/tmp/resolution_2026-04-05.md"
+
+    def fake_blocks(blocks, text=""):
+        sent["blocks"] = {"blocks": blocks, "text": text}
+        return False
+
+    def fake_message(text):
+        sent["text"] = text
+        return True
+
+    monkeypatch.setattr(alerts, "save_resolution_report", fake_report)
+    monkeypatch.setattr(alerts, "send_slack_blocks", fake_blocks)
+    monkeypatch.setattr(alerts, "send_slack_message", fake_message)
+    monkeypatch.setattr(alerts, "_get_live_portfolio_value", lambda: 1003.89)
+
+    alerts.alert_daily_summary({
+        "mode": "live",
+        "date": "2026-04-05",
+        "details": [
+            _detail(1, won=True, venue="kalshi"),
+            _detail(2, won=False, venue="kalshi") | {"side": "NO"},
+        ],
+    })
+
+    assert sent["blocks"] is not None
+    assert sent["text"] is not None
+    assert "Daily Live W/L — Sun Apr 5" in sent["text"]
+    assert "Previous day P&L: $+0.00" in sent["text"]
+    assert "Wins: 1 (1 buys, 0 sells)" in sent["text"]
+    assert "Losses: 1 (0 buys, 1 sells)" in sent["text"]
+    assert "Portfolio value: $1,003.89" in sent["text"]
 
 
 def test_build_trade_reason_uses_temp_gap_when_available():
@@ -116,6 +154,50 @@ def test_build_trade_reason_falls_back_to_probability_gap():
 
     assert "model 74% vs market 60%" in reason
     assert "underpriced" in reason
+
+
+def test_build_trade_reason_uses_probability_gap_for_open_ended_bucket():
+    reason = alerts._build_trade_reason(
+        _trade(
+            venue="kalshi",
+            side="BUY",
+            temp_low=-999.0,
+            temp_high=60.0,
+            model_expected_high=59.2,
+            selected_prob=0.57,
+            entry_price=0.08,
+            market_prob=0.08,
+        ),
+        {("los_angeles", "2026-04-11"): {"kalshi_implied_high": 63.8}},
+    )
+
+    assert "model 57% vs market 8%" in reason
+    assert "market-implied" not in reason
+
+
+def test_build_trade_context_line_for_contrarian_bucket():
+    context = alerts._build_trade_context_line(
+        _trade(
+            venue="kalshi",
+            side="BUY",
+            temp_low=-999.0,
+            temp_high=60.0,
+            edge=0.24,
+            selected_prob=0.57,
+            ensemble_prob=0.57,
+            model_expected_high=59.2,
+            venue_implied_high=63.9,
+            nws_forecast={"temp": 60},
+            ensemble_meta={"member_count": 30},
+            is_contrarian=True,
+        ),
+        {},
+    )
+
+    assert context == (
+        "Context: NWS 60F | Ensemble mean 59.2F | Market center 63.9F | "
+        "17/30 members <= 60F"
+    )
 
 
 def test_alert_scan_summary_renders_bet_first_layout(monkeypatch):
@@ -165,6 +247,36 @@ def test_alert_scan_summary_renders_bet_first_layout(monkeypatch):
     assert "Why: model 69.8F vs market-implied 70.9F, so Kalshi looks too hot" in bets_view
     assert "City/date view" not in bets_view
     assert "Venue comparison" not in bets_view
+
+
+def test_build_trade_alert_entry_includes_context_for_high_edge_bucket():
+    entry = alerts._build_trade_alert_entry(
+        _trade(
+            venue="kalshi",
+            city="nyc",
+            side="BUY",
+            target_date="2026-04-11",
+            temp_low=-999.0,
+            temp_high=60.0,
+            trade_size=30.0,
+            edge=0.24,
+            selected_prob=0.57,
+            ensemble_prob=0.57,
+            entry_price=0.08,
+            market_prob=0.08,
+            fee_pct=0.0,
+            model_expected_high=59.2,
+            venue_implied_high=63.9,
+            nws_forecast={"temp": 60},
+            ensemble_meta={"member_count": 30},
+            is_contrarian=True,
+        ),
+        {},
+    )
+
+    assert "Betting YES on 60°F or below" in entry
+    assert "Why: model 57% vs market 8%" in entry
+    assert "Context: NWS 60F | Ensemble mean 59.2F | Market center 63.9F | 17/30 members <= 60F" in entry
 
 
 def test_alert_scan_summary_orders_by_date_then_edge_and_omits_extra(monkeypatch):
@@ -268,7 +380,7 @@ def test_alert_daily_summary_skips_polymarket_only_days(monkeypatch):
     assert sent["text"] is None
 
 
-def test_alert_daily_summary_uses_kalshi_bullet_format(monkeypatch):
+def test_alert_daily_summary_uses_live_win_loss_format(monkeypatch):
     sent = {"blocks": None}
 
     def fake_report(details, stats):
@@ -280,24 +392,27 @@ def test_alert_daily_summary_uses_kalshi_bullet_format(monkeypatch):
 
     monkeypatch.setattr(alerts, "save_resolution_report", fake_report)
     monkeypatch.setattr(alerts, "send_slack_blocks", fake_blocks)
+    monkeypatch.setattr(alerts, "_get_live_portfolio_value", lambda: 1003.89)
 
     alerts.alert_daily_summary({
+        "mode": "live",
         "date": "2026-04-05",
-        "details": [_detail(1, venue="kalshi")],
-        "total_pnl": 123.45,
-        "all_time_win_rate": 0.55,
-        "all_time_trades": 9,
-        "pending_trades": 2,
+        "details": [
+            _detail(1, won=True, venue="kalshi"),
+            _detail(2, won=True, venue="kalshi") | {"side": "NO", "pnl": 12.0},
+            _detail(3, won=False, venue="kalshi") | {"side": "YES", "pnl": -7.0},
+        ],
     })
 
+    header_text = sent["blocks"][0]["text"]["text"]
     summary_view = sent["blocks"][1]["text"]["text"]
-    results_view = sent["blocks"][3]["text"]["text"]
-    footer_view = sent["blocks"][4]["elements"][0]["text"]
 
-    assert "All-time Kalshi" in summary_view
-    assert "City 1 | $50 -> $60 | YES Bucket range 1 wit" in results_view
-    assert "actual high was 71F" in results_view
-    assert "Full report" not in footer_view
+    assert "Daily Live W/L — Sun Apr 5" == header_text
+    assert "Previous day P&L: $+15.00" in summary_view
+    assert "Wins: 2 (1 buys, 1 sells)" in summary_view
+    assert "Losses: 1 (1 buys, 0 sells)" in summary_view
+    assert "Portfolio value: $1,003.89" in summary_view
+    assert len(sent["blocks"]) == 2
 
 
 def test_build_comparison_table_filters_empty_rows():
